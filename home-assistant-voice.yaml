@@ -1515,6 +1515,9 @@ external_components:
       - voice_assistant
       - voice_kit
     refresh: 0s
+  - source: github://pr#8018
+    components: [http_request]
+    refresh: 0s
 
 audio_dac:
   - platform: aic3204
