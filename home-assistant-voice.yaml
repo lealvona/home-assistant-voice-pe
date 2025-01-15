@@ -1663,6 +1663,12 @@ button:
     name: "Factory Reset"
     entity_category: diagnostic
     internal: true
+  - platform: restart
+    id: restart_button
+    name: "Restart"
+    entity_category: config
+    disabled_by_default: true
+    icon: "mdi:restart"
 
 debug:
   update_interval: 5s
