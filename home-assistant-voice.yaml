@@ -432,9 +432,9 @@ binary_sensor:
                     config.timeout_ms = 1500;
                     esp_http_client_handle_t client = esp_http_client_init(&config);
                     if (client != nullptr) {
-                      const char *body = "{\"source\":\"home-assistant-voice-090481\",\"event\":\"double_press\"}";
+                      std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"double_press\"}";
                       esp_http_client_set_header(client, "Content-Type", "application/json");
-                      esp_http_client_set_post_field(client, body, strlen(body));
+                      esp_http_client_set_post_field(client, body.c_str(), body.length());
                       esp_err_t err = esp_http_client_perform(client);
                       ESP_LOGI("camera_webhook", "camera webhook POST result: %s", esp_err_to_name(err));
                       esp_http_client_cleanup(client);
@@ -2069,7 +2069,7 @@ voice_assistant:
                 else if (c == '\r') escaped += "\\r";
                 else escaped += c;
               }
-              std::string body = "{\"source\":\"home-assistant-voice-090481\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
+              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
               esp_http_client_config_t config = {};
               config.url = "http://REDACTED_IP:8895/api/voice-pe/research";
               config.method = HTTP_METHOD_POST;
@@ -2117,7 +2117,7 @@ voice_assistant:
                 else if (c == '\r') escaped += "\\r";
                 else escaped += c;
               }
-              std::string body = "{\"source\":\"home-assistant-voice-090481\",\"text\":\"" + escaped + "\"}";
+              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"text\":\"" + escaped + "\"}";
               esp_http_client_config_t config = {};
               config.url = "http://REDACTED_IP:6060/quick-chat";
               config.method = HTTP_METHOD_POST;
