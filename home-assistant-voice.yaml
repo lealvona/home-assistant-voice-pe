@@ -886,11 +886,12 @@ light:
           twinkle_probability: 50%
       - addressable_lambda:
           name: "Error"
-          update_interval: 10ms
+          # Slow red breathing effect; avoid harsh flashing.
+          update_interval: 60ms
           lambda: |-
             static uint8_t brightness_step = 0;
             static bool brightness_decreasing = true;
-            static uint8_t brightness_step_number = 10;
+            static uint8_t brightness_step_number = 30;
             if (initial_run) {
               brightness_step = 0;
               brightness_decreasing = true;
@@ -909,11 +910,12 @@ light:
             }
       - addressable_lambda:
           name: "Timer Ring"
-          update_interval: 10ms
+          # Slow breathing effect for spoken audio; avoid harsh flashing.
+          update_interval: 40ms
           lambda: |-
             static uint8_t brightness_step = 0;
             static bool brightness_decreasing = true;
-            static uint8_t brightness_step_number = 10;
+            static uint8_t brightness_step_number = 50;
             if (initial_run) {
               brightness_step = 0;
               brightness_decreasing = true;
