@@ -185,6 +185,18 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Global variable tracking if a quick-chat answer is still pending. Keeps LEDs purple
+  # after STT finishes until the receipt/final answer plays or timeout/error fires.
+  - id: quick_chat_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Count quick-chat announcements heard while quick_chat_pending is true:
+  # 1 = receipt, 2 = final answer. Used to return LEDs to idle after final response.
+  - id: quick_chat_announcement_count
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Global variable tracking if the jack has been plugged touched.
   - id: jack_plugged_recently
     type: bool
@@ -368,6 +380,10 @@ binary_sensor:
                                             then:
                                               - lambda: |-
                                                   ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
+                                                  id(quick_chat_pending) = false;
+                                                  id(quick_chat_announcement_count) = 0;
+                                                  id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+                                              - script.execute: control_leds
                                               - media_player.stop:
                                                   id: external_media_player
                                                   announcement: true
@@ -383,6 +399,8 @@ binary_sensor:
                                                         id: external_media_player
                                                   timeout: 5s
                                               - delay: 150ms
+                                              - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                                              - script.execute: control_leds
                                               - voice_assistant.start:
                                                   silence_detection: true
       # Double Click
@@ -469,6 +487,8 @@ binary_sensor:
                       - lambda: |-
                           ESP_LOGI("research_webhook", "long-press research mode armed; playing prompt");
                           id(research_capture_requested) = true;
+                          id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+                      - script.execute: control_leds
                       - media_player.stop:
                           id: external_media_player
                           announcement: true
@@ -486,6 +506,8 @@ binary_sensor:
                       - delay: 300ms
                       - lambda: |-
                           ESP_LOGI("research_webhook", "prompt complete/timeout; starting research STT");
+                          id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+                      - script.execute: control_leds
                       - voice_assistant.start:
                           silence_detection: true
                     else:
@@ -1120,6 +1142,24 @@ event:
       - easter_egg_press
 
 script:
+  - id: quick_chat_timeout
+    mode: restart
+    then:
+      - delay: 90s
+      - if:
+          condition:
+            lambda: return id(quick_chat_pending);
+          then:
+            - lambda: |-
+                ESP_LOGW("quick_chat", "quick chat timed out waiting for final response; showing LED error");
+                id(quick_chat_pending) = false;
+                id(quick_chat_announcement_count) = 0;
+                id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+            - script.execute: control_leds
+            - delay: 3s
+            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            - script.execute: control_leds
+
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
@@ -1243,41 +1283,77 @@ script:
           then:
             light.turn_on: led_ring
 
-  # Script executed when the voice assistant is waiting for a command (After the wake word)
-  # Slow clockwise spin of the LED ring.
+  # Script executed when the voice assistant is waiting for a command (after prompt/wake)
+  # Amber steady: wake word triggered, waiting for user to speak.
   - id: control_leds_voice_assistant_waiting_for_command_phase
     then:
       - light.turn_on:
-          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
+          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.35f );
+          red: 100%
+          green: 60%
+          blue: 0%
           id: voice_assistant_leds
-          effect: "Waiting for Command"
+          effect: "none"
 
   # Script executed when the voice assistant is listening to a command
-  # Fast clockwise spin of the LED ring.
+  # Green solid (quick-chat) or cyan solid (research) — recording/speech capture.
   - id: control_leds_voice_assistant_listening_for_command_phase
     then:
-      - light.turn_on:
-          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
-          id: voice_assistant_leds
-          effect: "Listening For Command"
+      - if:
+          condition:
+            lambda: return id(research_capture_requested);
+          then:
+            - light.turn_on:
+                brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.45f );
+                red: 0%
+                green: 90%
+                blue: 80%
+                id: voice_assistant_leds
+                effect: "none"
+          else:
+            - light.turn_on:
+                brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.45f );
+                red: 0%
+                green: 100%
+                blue: 0%
+                id: voice_assistant_leds
+                effect: "none"
 
-  # Script executed when the voice assistant is thinking to a command
-  # The spin stops and the 2 LEDs that are currently on and blinking indicating the commend is being processed.
+  # Script executed when the voice assistant is thinking/awaiting Hermes.
+  # Purple spin (quick-chat) or magenta pulse (research): waiting for response or error.
   - id: control_leds_voice_assistant_thinking_phase
     then:
-      - light.turn_on:
-          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
-          id: voice_assistant_leds
-          effect: "Thinking"
+      - if:
+          condition:
+            lambda: return id(research_capture_requested);
+          then:
+            - light.turn_on:
+                brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.35f );
+                red: 100%
+                green: 0%
+                blue: 70%
+                id: voice_assistant_leds
+                effect: "Thinking"
+          else:
+            - light.turn_on:
+                brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.35f );
+                red: 55%
+                green: 0%
+                blue: 100%
+                id: voice_assistant_leds
+                effect: "Waiting for Command"
 
-  # Script executed when the voice assistant is thinking to a command
-  # Fast anticlockwise spin of the LED ring.
+  # Script executed when the device is talking.
+  # Pulsing blue for prompt, receipt, and final spoken response.
   - id: control_leds_voice_assistant_replying_phase
     then:
       - light.turn_on:
-          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
+          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.35f );
+          red: 0%
+          green: 30%
+          blue: 100%
           id: voice_assistant_leds
-          effect: "Replying"
+          effect: "Timer Ring"
 
   # Script executed when the voice assistant is in error
   # Fast Red Pulse
@@ -1736,24 +1812,48 @@ media_player:
     on_volume:
       - script.execute: control_leds
     on_announcement:
+      - if:
+          condition:
+            switch.is_off: timer_ringing
+          then:
+            - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+            - script.execute: control_leds
       - mixer_speaker.apply_ducking:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
     on_state:
-      if:
-        condition:
-          and:
-            - switch.is_off: timer_ringing
-            - not:
-                voice_assistant.is_running:
-            - not:
-                media_player.is_announcing: external_media_player
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_mixing_input
-              decibel_reduction: 0
-              duration: 1.0s
+      - if:
+          condition:
+            and:
+              - lambda: return id(quick_chat_pending) && id(voice_assistant_phase) == ${voice_assist_replying_phase_id};
+              - not:
+                  media_player.is_announcing: external_media_player
+          then:
+            - lambda: |-
+                id(quick_chat_announcement_count) += 1;
+                ESP_LOGI("quick_chat", "quick-chat announcement finished count=%d", id(quick_chat_announcement_count));
+                if (id(quick_chat_announcement_count) >= 2) {
+                  id(quick_chat_pending) = false;
+                  id(quick_chat_announcement_count) = 0;
+                  id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                } else {
+                  id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+                }
+            - script.execute: control_leds
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing: external_media_player
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_mixing_input
+                decibel_reduction: 0
+                duration: 1.0s
 
 voice_kit:
   id: voice_kit_component
@@ -2010,8 +2110,16 @@ voice_assistant:
               ESP_LOGI("quick_chat", "non-research STT ended; transcript length=%u", (unsigned) transcript.size());
               if (transcript.empty()) {
                 ESP_LOGW("quick_chat", "quick chat had empty transcript");
+                id(quick_chat_pending) = false;
+                id(quick_chat_announcement_count) = 0;
+                id(voice_assistant_phase) = ${voice_assist_error_phase_id};
                 return;
               }
+              id(quick_chat_pending) = true;
+              id(quick_chat_announcement_count) = 0;
+              id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+              id(control_leds).execute();
+              id(quick_chat_timeout).execute();
               std::string escaped;
               escaped.reserve(transcript.size() + 64);
               for (char c : transcript) {
@@ -2033,9 +2141,20 @@ voice_assistant:
                 esp_err_t err = esp_http_client_perform(client);
                 int status = esp_http_client_get_status_code(client);
                 ESP_LOGI("quick_chat", "quick-chat POST result: %s http_status=%d", esp_err_to_name(err), status);
+                if (err != ESP_OK || status < 200 || status >= 300) {
+                  ESP_LOGW("quick_chat", "quick-chat POST failed; showing LED error");
+                  id(quick_chat_pending) = false;
+                  id(quick_chat_announcement_count) = 0;
+                  id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+                  id(control_leds).execute();
+                }
                 esp_http_client_cleanup(client);
               } else {
                 ESP_LOGW("quick_chat", "failed to initialize quick-chat HTTP client");
+                id(quick_chat_pending) = false;
+                id(quick_chat_announcement_count) = 0;
+                id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+                id(control_leds).execute();
               }
   on_intent_progress:
     - if:
@@ -2073,8 +2192,15 @@ voice_assistant:
           lambda: return id(voice_assistant_phase) == ${voice_assist_error_phase_id};
         then:
           - delay: 1s
-    # Reset the voice assistant phase id and reset the LED animations.
-    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+    # Reset the voice assistant phase id and reset the LED animations, except
+    # quick-chat stays purple while Hermes is thinking after STT has ended.
+    - if:
+        condition:
+          lambda: return id(quick_chat_pending);
+        then:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+        else:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
   on_timer_finished:
     - switch.turn_on: timer_ringing
