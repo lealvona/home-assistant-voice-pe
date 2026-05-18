@@ -80,9 +80,25 @@ esp32:
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"  # TLS1.3 support isn't enabled by default in IDF 5.1.5
 
+      # LWIP core locking fix — prevents music playback stuttering on some networks
+      # See: https://github.com/esphome/home-assistant-voice-pe/issues/455
+      CONFIG_LWIP_TCPIP_CORE_LOCKING: "n"
+
 wifi:
   id: wifi_id
-  fast_connect: ${hidden_ssid}
+  domain: .local
+  reboot_timeout: 15min
+  power_save_mode: LIGHT
+  enable_btm: false
+  enable_rrm: false
+  passive_scan: false
+  networks:
+    - ssid: "URSTOMPING"
+      password: "***REMOVED***"
+      priority: 1
+    - ssid: "URSTOMPING-5G"
+      password: "***REMOVED***"
+      priority: 0
   on_connect:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
@@ -161,6 +177,11 @@ globals:
     initial_value: 'false'
   # Global variable tracking if the group media player volume was recent changed.
   - id: group_volume_changed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Global variable tracking if the next STT result should be sent to Hermes research intake.
+  - id: research_capture_requested
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -343,13 +364,27 @@ binary_sensor:
                                               and:
                                                 - switch.is_off: master_mute_switch
                                                 - not: voice_assistant.is_running
+                                                - lambda: return id(va).get_api_connection() != nullptr;
                                             then:
-                                              - script.execute:
-                                                  id: play_sound
-                                                  priority: true
-                                                  sound_file: "center_button_press_sound"
+                                              - lambda: |-
+                                                  ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
+                                              - media_player.stop:
+                                                  id: external_media_player
+                                                  announcement: true
+                                              - media_player.play_media:
+                                                  id: external_media_player
+                                                  media_url: "http://192.168.1.144:6060/quick-chat-static/quick_chat_prompt.mp3"
+                                                  announcement: true
                                               - delay: 300ms
+                                              - wait_until:
+                                                  condition:
+                                                    not:
+                                                      media_player.is_announcing:
+                                                        id: external_media_player
+                                                  timeout: 5s
+                                              - delay: 150ms
                                               - voice_assistant.start:
+                                                  silence_detection: true
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -369,6 +404,25 @@ binary_sensor:
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
+                # Local camera workflow trigger on pai. This preserves the normal
+                # Home Assistant event while giving the physical double-click a
+                # direct LAN fallback even when HA entity state is unavailable.
+                - lambda: |-
+                    esp_http_client_config_t config = {};
+                    config.url = "http://192.168.1.144:8900/button";
+                    config.method = HTTP_METHOD_POST;
+                    config.timeout_ms = 1500;
+                    esp_http_client_handle_t client = esp_http_client_init(&config);
+                    if (client != nullptr) {
+                      const char *body = "{\"source\":\"home-assistant-voice-090481\",\"event\":\"double_press\"}";
+                      esp_http_client_set_header(client, "Content-Type", "application/json");
+                      esp_http_client_set_post_field(client, body, strlen(body));
+                      esp_err_t err = esp_http_client_perform(client);
+                      ESP_LOGI("camera_webhook", "camera webhook POST result: %s", esp_err_to_name(err));
+                      esp_http_client_cleanup(client);
+                    } else {
+                      ESP_LOGW("camera_webhook", "failed to initialize camera webhook client");
+                    }
       # Triple Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -399,14 +453,44 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
-                - script.execute:
-                    id: play_sound
-                    priority: false
-                    sound_file: "center_button_long_press_sound"
                 - light.turn_off: voice_assistant_leds
                 - event.trigger:
                     id: button_press_event
                     event_type: "long_press"
+                # Research capture: ask the prompt, then start one STT run. The
+                # on_stt_end hook below posts the transcript to .115.
+                - if:
+                    condition:
+                      and:
+                        - switch.is_off: master_mute_switch
+                        - not: voice_assistant.is_running
+                        - lambda: return id(va).get_api_connection() != nullptr;
+                    then:
+                      - lambda: |-
+                          ESP_LOGI("research_webhook", "long-press research mode armed; playing prompt");
+                          id(research_capture_requested) = true;
+                      - media_player.stop:
+                          id: external_media_player
+                          announcement: true
+                      - media_player.play_media:
+                          id: external_media_player
+                          media_url: "http://192.168.1.115:8895/static/research_prompt.mp3"
+                          announcement: true
+                      - delay: 500ms
+                      - wait_until:
+                          condition:
+                            not:
+                              media_player.is_announcing:
+                                id: external_media_player
+                          timeout: 10s
+                      - delay: 300ms
+                      - lambda: |-
+                          ESP_LOGI("research_webhook", "prompt complete/timeout; starting research STT");
+                      - voice_assistant.start:
+                          silence_detection: true
+                    else:
+                      - lambda: |-
+                          ESP_LOGW("research_webhook", "research long-press skipped: mute=%d running=%d voice_api_client=%d", id(master_mute_switch).state, id(va).is_running(), id(va).get_api_connection() != nullptr);
       # Very important do not remove. Trust me :D
       - timing:
           # H ....
@@ -1752,6 +1836,7 @@ micro_wake_word:
                                   - delay: 300ms
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
+                                silence_detection: true
 
 select:
   - platform: template
@@ -1799,15 +1884,24 @@ voice_assistant:
   auto_gain: 0 dbfs
   volume_multiplier: 1
   on_client_connected:
-    - lambda: id(init_in_progress) = false;
+    - lambda: |-
+        ESP_LOGI("research_webhook", "voice assistant API client connected");
+        id(init_in_progress) = false;
     - micro_wake_word.start:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
   on_client_disconnected:
+    - lambda: |-
+        ESP_LOGW("research_webhook", "voice assistant API client disconnected");
     - voice_assistant.stop:
     - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
     - script.execute: control_leds
   on_error:
+    - lambda: |-
+        if (id(research_capture_requested)) {
+          ESP_LOGW("research_webhook", "clearing research capture flag after voice assistant error: %s", code.c_str());
+          id(research_capture_requested) = false;
+        }
     # Only set the error phase if the error code is different than duplicate_wake_up_detected or stt-no-text-recognized
     # These two are ignored for a better user experience
     - if:
@@ -1843,6 +1937,92 @@ voice_assistant:
   on_stt_vad_end:
     - lambda: id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
     - script.execute: control_leds
+    - if:
+        condition:
+          lambda: return id(research_capture_requested);
+        then:
+          - script.execute:
+              id: play_sound
+              priority: true
+              sound_file: "center_button_press_sound"
+  on_stt_end:
+    - if:
+        condition:
+          lambda: return id(research_capture_requested);
+        then:
+          - lambda: |-
+              id(research_capture_requested) = false;
+              std::string transcript = x;
+              ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
+              if (transcript.empty()) {
+                ESP_LOGW("research_webhook", "research capture had empty transcript");
+                return;
+              }
+              std::string escaped;
+              escaped.reserve(transcript.size() + 64);
+              for (char c : transcript) {
+                if (c == '\\') escaped += "\\\\";
+                else if (c == '"') escaped += "\\\"";
+                else if (c == '\n') escaped += "\\n";
+                else if (c == '\r') escaped += "\\r";
+                else escaped += c;
+              }
+              std::string body = "{\"source\":\"home-assistant-voice-090481\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
+              esp_http_client_config_t config = {};
+              config.url = "http://192.168.1.115:8895/api/voice-pe/research";
+              config.method = HTTP_METHOD_POST;
+              config.timeout_ms = 3000;
+              esp_http_client_handle_t client = esp_http_client_init(&config);
+              if (client != nullptr) {
+                esp_http_client_set_header(client, "Content-Type", "application/json");
+                esp_http_client_set_post_field(client, body.c_str(), body.length());
+                esp_err_t err = esp_http_client_perform(client);
+                int status = esp_http_client_get_status_code(client);
+                ESP_LOGI("research_webhook", "research ask POST result: %s http_status=%d", esp_err_to_name(err), status);
+                esp_http_client_cleanup(client);
+              } else {
+                ESP_LOGW("research_webhook", "failed to initialize research webhook client");
+              }
+          - media_player.play_media:
+              id: external_media_player
+              media_url: "http://192.168.1.115:8895/static/research_started.mp3"
+              announcement: true
+          - voice_assistant.stop:
+        # Quick Chat: single-press transcripts go to the bridge for
+        # immediate LLM query + TTS playback.
+        else:
+          - lambda: |-
+              std::string transcript = x;
+              ESP_LOGI("quick_chat", "non-research STT ended; transcript length=%u", (unsigned) transcript.size());
+              if (transcript.empty()) {
+                ESP_LOGW("quick_chat", "quick chat had empty transcript");
+                return;
+              }
+              std::string escaped;
+              escaped.reserve(transcript.size() + 64);
+              for (char c : transcript) {
+                if (c == '\\') escaped += "\\\\";
+                else if (c == '"') escaped += "\\\"";
+                else if (c == '\n') escaped += "\\n";
+                else if (c == '\r') escaped += "\\r";
+                else escaped += c;
+              }
+              std::string body = "{\"source\":\"home-assistant-voice-090481\",\"text\":\"" + escaped + "\"}";
+              esp_http_client_config_t config = {};
+              config.url = "http://192.168.1.144:6060/quick-chat";
+              config.method = HTTP_METHOD_POST;
+              config.timeout_ms = 1500;
+              esp_http_client_handle_t client = esp_http_client_init(&config);
+              if (client != nullptr) {
+                esp_http_client_set_header(client, "Content-Type", "application/json");
+                esp_http_client_set_post_field(client, body.c_str(), body.length());
+                esp_err_t err = esp_http_client_perform(client);
+                int status = esp_http_client_get_status_code(client);
+                ESP_LOGI("quick_chat", "quick-chat POST result: %s http_status=%d", esp_err_to_name(err), status);
+                esp_http_client_cleanup(client);
+              } else {
+                ESP_LOGW("quick_chat", "failed to initialize quick-chat HTTP client");
+              }
   on_intent_progress:
     - if:
         condition:
