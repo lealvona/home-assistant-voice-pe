@@ -118,11 +118,11 @@ wifi:
   enable_rrm: false
   passive_scan: false
   networks:
-    - ssid: "URSTOMPING"
-      password: "***REMOVED***"
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
       priority: 1
-    - ssid: "URSTOMPING-5G"
-      password: "***REMOVED***"
+    - ssid: !secret wifi_ssid_5g
+      password: !secret wifi_password
       priority: 0
   on_connect:
     - lambda: id(improv_ble_in_progress) = false;
