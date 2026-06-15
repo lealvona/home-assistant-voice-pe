@@ -1,3 +1,28 @@
+# ==============================================================================
+# Custom Home Assistant Voice PE firmware — lealvona fork.
+#
+# Two dispatch paths with deliberately ASYMMETRIC resilience profiles:
+#
+#   Long-press → Research Asks
+#     on_stt_end below tries the bridge proxy at REDACTED_ENDPOINT/research FIRST with
+#     a short (800ms) timeout, then FALLS BACK to a direct POST to
+#     REDACTED_ENDPOINT/api/voice-pe/research. Research dispatch survives the bridge
+#     being down: failure routes around the more-failure-prone Pi 5 + Python
+#     bridge straight to .115.
+#
+#   Short-press / Wake-word → Quick Chat
+#     The BRIDGE owns dispatch end-to-end: STT → local LLM → edge-tts → audio
+#     URL playback back to the Voice PE. Quick Chat survives the cloud / .115
+#     being down (local LLM + local TTS), but requires the bridge to be alive.
+#     Double-press additionally arms a photo-augmented Quick Chat: the next
+#     utterance triggers a 3-2-1 countdown TTS, a JPEG snapshot capture from
+#     the configured CAMERA_SNAPSHOT_URL, and a multimodal LLM call.
+#
+# This asymmetry is INTENTIONAL — each path is matched to its workload's
+# reliability vs. flexibility profile. See bridge module docstring at
+# REDACTED_PATH/
+# voice_pe_research_bridge.py for the architectural rationale.
+# ==============================================================================
 substitutions:
   # Phases of the Voice Assistant
   # The voice assistant is ready to be triggered by a wake word
@@ -191,6 +216,26 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # True only during quick-chat announcement sequences (receipt + final answer).
+  # Prevents research completion announcements from corrupting the count.
+  - id: quick_chat_expecting_announcement
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Generation counter for quick-chat requests. Incremented on each button press.
+  # The on_state handler only counts announcements matching the current generation,
+  # so overlapping requests (pressing again before the first answer arrives) don't
+  # corrupt each other's state.
+  - id: quick_chat_generation
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # The generation that was active when the current quick-chat STT ended.
+  # If this doesn't match quick_chat_generation, the announcement is stale.
+  - id: quick_chat_active_generation
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Count quick-chat announcements heard while quick_chat_pending is true:
   # 1 = receipt, 2 = final answer. Used to return LEDs to idle after final response.
   - id: quick_chat_announcement_count
@@ -267,8 +312,6 @@ switch:
     internal: true
     restore_mode: ALWAYS_OFF
     on_turn_off:
-      # Disable stop wake word
-      - micro_wake_word.disable_model: stop
       - script.execute: disable_repeat
       # Stop any current announcement (ie: stop the timer ring mid playback)
       - if:
@@ -292,8 +335,6 @@ switch:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
-      # Enable stop wake word
-      - micro_wake_word.enable_model: stop
       # Ring timer
       - script.execute: ring_timer
       # Refresh LED
@@ -381,7 +422,9 @@ binary_sensor:
                                               - lambda: |-
                                                   ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
                                                   id(quick_chat_pending) = false;
+                                                  id(quick_chat_expecting_announcement) = false;
                                                   id(quick_chat_announcement_count) = 0;
+                                                  id(quick_chat_generation) += 1;
                                                   id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
                                               - script.execute: control_leds
                                               - media_player.stop:
@@ -1155,6 +1198,7 @@ script:
             - lambda: |-
                 ESP_LOGW("quick_chat", "quick chat timed out waiting for final response; showing LED error");
                 id(quick_chat_pending) = false;
+                id(quick_chat_expecting_announcement) = false;
                 id(quick_chat_announcement_count) = 0;
                 id(voice_assistant_phase) = ${voice_assist_error_phase_id};
             - script.execute: control_leds
@@ -1646,12 +1690,14 @@ script:
               id: external_media_player
           timeout: 5s
       - delay: 1s
-      # Enable stop wake word
+      # The stock firmware temporarily enabled the built-in `stop` wake word
+      # here. This fleet supports arbitrary per-device wake-word lists, so the
+      # stop model may not be present. Keep the timing behavior, but do not
+      # reference a model ID that may not exist.
       - if:
           condition:
             switch.is_off: timer_ringing
           then:
-            - micro_wake_word.enable_model: stop
             - wait_until:
                 not:
                   media_player.is_announcing:
@@ -1660,7 +1706,10 @@ script:
                 condition:
                   switch.is_off: timer_ringing
                 then:
-                  - micro_wake_word.disable_model: stop
+                  - logger.log:
+                      tag: voice_assistant
+                      level: DEBUG
+                      format: "Announcement finished; no temporary stop model configured"
 
 i2s_audio:
   - id: i2s_output
@@ -1825,7 +1874,7 @@ media_player:
       - if:
           condition:
             and:
-              - lambda: return id(quick_chat_pending) && id(voice_assistant_phase) == ${voice_assist_replying_phase_id};
+              - lambda: return id(quick_chat_pending) && id(quick_chat_expecting_announcement) && id(quick_chat_active_generation) == id(quick_chat_generation) && (id(voice_assistant_phase) == ${voice_assist_replying_phase_id} || id(voice_assistant_phase) == ${voice_assist_thinking_phase_id});
               - not:
                   media_player.is_announcing: external_media_player
           then:
@@ -1834,6 +1883,7 @@ media_player:
                 ESP_LOGI("quick_chat", "quick-chat announcement finished count=%d", id(quick_chat_announcement_count));
                 if (id(quick_chat_announcement_count) >= 2) {
                   id(quick_chat_pending) = false;
+                  id(quick_chat_expecting_announcement) = false;
                   id(quick_chat_announcement_count) = 0;
                   id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
                 } else {
@@ -1886,15 +1936,14 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: hey_mycroft
-      id: hey_mycroft
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
-      id: stop
-      internal: true
+    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWordsV3/hey_computer.json
+      id: hey_computer
+    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWordsV3/ok_computer.json
+      id: ok_computer
+    - model: https://raw.githubusercontent.com/andrew-transparent/carson-wake-words/main/mister_carson.json
+      id: mister_carson
+    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWords/janet.json
+      id: janet
   vad:
   on_wake_word_detected:
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
@@ -1925,17 +1974,33 @@ micro_wake_word:
                             - media_player.stop:
                                 announcement: true
                                 id: external_media_player
-                          # Start the voice assistant and play the wake sound, if enabled
+                          # Start the voice assistant. When wake_sound is on,
+                          # play a context-relevant verbal greeting served by
+                          # the bridge ("Yes?") instead of the generic chime —
+                          # this signals the user that the wake-word Quick Chat
+                          # path is active, distinct from the long-press
+                          # research_started prompt. The chime is preserved as
+                          # the fallback if the bridge audio file is unavailable
+                          # (media_player.play_media is best-effort).
                           else:
                             - if:
                                 condition:
                                   switch.is_on: wake_sound
                                 then:
-                                  - script.execute:
-                                      id: play_sound
-                                      priority: true
-                                      sound_file: "wake_word_triggered_sound"
-                                  - delay: 300ms
+                                  - media_player.stop:
+                                      id: external_media_player
+                                      announcement: true
+                                  - media_player.play_media:
+                                      id: external_media_player
+                                      media_url: "http://REDACTED_IP:6060/quick-chat-static/quick_chat_wake.mp3"
+                                      announcement: true
+                                  - delay: 350ms
+                                  - wait_until:
+                                      condition:
+                                        not:
+                                          media_player.is_announcing:
+                                            id: external_media_player
+                                      timeout: 1500ms
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
                                 silence_detection: true
@@ -1953,24 +2018,15 @@ select:
       - Moderately sensitive
       - Very sensitive
     on_value:
-      # Sets specific wake word probabilities computed for each particular model
-      # Note probability cutoffs are set as a quantized uint8 value, each comment has the corresponding floating point cutoff
-      # False Accepts per Hour values are tested against all units and channels from the Dinner Party Corpus.
-      # These cutoffs apply only to the specific models included in the firmware: okay_nabu@20241226.3, hey_jarvis@v2, hey_mycroft@v2
-      lambda: |-
-        if (x == "Slightly sensitive") {
-          id(okay_nabu).set_probability_cutoff(217);    // 0.85 -> 0.000 FAPH on DipCo (Manifest's default)
-          id(hey_jarvis).set_probability_cutoff(247);   // 0.97 -> 0.563 FAPH on DipCo (Manifest's default)
-          id(hey_mycroft).set_probability_cutoff(253);  // 0.99 -> 0.567 FAPH on DipCo
-        } else if (x == "Moderately sensitive") {
-          id(okay_nabu).set_probability_cutoff(176);    // 0.69 -> 0.376 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(235);   // 0.92 -> 0.939 FAPH on DipCo
-          id(hey_mycroft).set_probability_cutoff(242);  // 0.95 -> 1.502 FAPH on DipCo (Manifest's default)
-        } else if (x == "Very sensitive") {
-          id(okay_nabu).set_probability_cutoff(143);    // 0.56 -> 0.751 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(212);   // 0.83 -> 1.502 FAPH on DipCo
-          id(hey_mycroft).set_probability_cutoff(237);  // 0.93 -> 1.878 FAPH on DipCo
-        }
+      # Dynamic/community wake-word models do not share the calibrated cutoff
+      # values that the stock firmware used for okay_nabu / hey_jarvis /
+      # hey_mycroft. Keep the UI entity for compatibility, but do not reference
+      # hard-coded model IDs that may not be present in a per-device build.
+      - logger.log:
+          tag: voice_assistant
+          level: INFO
+          format: "Wake word sensitivity preset selected: %s; custom models keep their model defaults"
+          args: ["x.c_str()"]
 
 voice_assistant:
   id: va
@@ -2053,6 +2109,12 @@ voice_assistant:
           lambda: return id(research_capture_requested);
         then:
           - lambda: |-
+              // Long-press research dispatch (asymmetric resilience pattern).
+              // Try the bridge proxy at REDACTED_ENDPOINT/research FIRST with a short
+              // timeout — when the bridge is up, this lets it observe / enrich
+              // the request. On any failure (timeout, non-2xx, ESP error) fall
+              // back to a direct POST to .115 so research dispatch survives the
+              // bridge being down. See bridge module docstring for rationale.
               id(research_capture_requested) = false;
               std::string transcript = x;
               ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
@@ -2070,20 +2132,45 @@ voice_assistant:
                 else escaped += c;
               }
               std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
-              esp_http_client_config_t config = {};
-              config.url = "http://REDACTED_IP:8895/api/voice-pe/research";
-              config.method = HTTP_METHOD_POST;
-              config.timeout_ms = 3000;
-              esp_http_client_handle_t client = esp_http_client_init(&config);
-              if (client != nullptr) {
-                esp_http_client_set_header(client, "Content-Type", "application/json");
-                esp_http_client_set_post_field(client, body.c_str(), body.length());
-                esp_err_t err = esp_http_client_perform(client);
-                int status = esp_http_client_get_status_code(client);
-                ESP_LOGI("research_webhook", "research ask POST result: %s http_status=%d", esp_err_to_name(err), status);
-                esp_http_client_cleanup(client);
-              } else {
-                ESP_LOGW("research_webhook", "failed to initialize research webhook client");
+
+              // Attempt 1: bridge proxy on REDACTED_ENDPOINT/research, short timeout.
+              esp_http_client_config_t bridge_config = {};
+              bridge_config.url = "http://REDACTED_IP:8900/research";
+              bridge_config.method = HTTP_METHOD_POST;
+              bridge_config.timeout_ms = 800;
+              esp_http_client_handle_t bridge_client = esp_http_client_init(&bridge_config);
+              esp_err_t bridge_err = ESP_FAIL;
+              int bridge_status = 0;
+              if (bridge_client != nullptr) {
+                esp_http_client_set_header(bridge_client, "Content-Type", "application/json");
+                esp_http_client_set_post_field(bridge_client, body.c_str(), body.length());
+                bridge_err = esp_http_client_perform(bridge_client);
+                bridge_status = esp_http_client_get_status_code(bridge_client);
+                ESP_LOGI("research_webhook", "bridge proxy POST: %s http_status=%d", esp_err_to_name(bridge_err), bridge_status);
+                esp_http_client_cleanup(bridge_client);
+              }
+
+              // Attempt 2 (fallback): direct POST to .115 if the bridge errored
+              // or returned non-2xx. We accept ANY 2xx from the bridge as a
+              // successful dispatch (bridge has already forwarded to .115).
+              bool bridge_ok = (bridge_err == ESP_OK) && (bridge_status >= 200) && (bridge_status < 300);
+              if (!bridge_ok) {
+                ESP_LOGW("research_webhook", "bridge proxy unavailable (err=%s status=%d); falling back to direct .115 POST", esp_err_to_name(bridge_err), bridge_status);
+                esp_http_client_config_t fallback_config = {};
+                fallback_config.url = "http://REDACTED_IP:8895/api/voice-pe/research";
+                fallback_config.method = HTTP_METHOD_POST;
+                fallback_config.timeout_ms = 3000;
+                esp_http_client_handle_t fallback_client = esp_http_client_init(&fallback_config);
+                if (fallback_client != nullptr) {
+                  esp_http_client_set_header(fallback_client, "Content-Type", "application/json");
+                  esp_http_client_set_post_field(fallback_client, body.c_str(), body.length());
+                  esp_err_t err = esp_http_client_perform(fallback_client);
+                  int status = esp_http_client_get_status_code(fallback_client);
+                  ESP_LOGI("research_webhook", "direct .115 fallback POST: %s http_status=%d", esp_err_to_name(err), status);
+                  esp_http_client_cleanup(fallback_client);
+                } else {
+                  ESP_LOGW("research_webhook", "failed to initialize fallback research webhook client");
+                }
               }
           - media_player.play_media:
               id: external_media_player
@@ -2099,11 +2186,14 @@ voice_assistant:
               if (transcript.empty()) {
                 ESP_LOGW("quick_chat", "quick chat had empty transcript");
                 id(quick_chat_pending) = false;
+                id(quick_chat_expecting_announcement) = false;
                 id(quick_chat_announcement_count) = 0;
                 id(voice_assistant_phase) = ${voice_assist_error_phase_id};
                 return;
               }
               id(quick_chat_pending) = true;
+              id(quick_chat_expecting_announcement) = true;
+              id(quick_chat_active_generation) = id(quick_chat_generation);
               id(quick_chat_announcement_count) = 0;
               id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
               id(control_leds).execute();
