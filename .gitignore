@@ -138,3 +138,6 @@ sdkconfig.*
 .tests/
 
 /components
+
+# Local-only secrets (WiFi creds, etc) — do NOT commit
+secrets.yaml
