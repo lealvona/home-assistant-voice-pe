@@ -4,24 +4,23 @@
 # Two dispatch paths with deliberately ASYMMETRIC resilience profiles:
 #
 #   Long-press → Research Asks
-#     on_stt_end below tries the bridge proxy at REDACTED_ENDPOINT/research FIRST with
-#     a short (800ms) timeout, then FALLS BACK to a direct POST to
-#     REDACTED_ENDPOINT/api/voice-pe/research. Research dispatch survives the bridge
-#     being down: failure routes around the more-failure-prone Pi 5 + Python
-#     bridge straight to .115.
+#     on_stt_end below tries the bridge proxy FIRST with a short (800ms)
+#     timeout, then FALLS BACK to a direct POST to the research backend.
+#     Research dispatch survives the bridge being down: failure routes
+#     around the more-failure-prone bridge straight to the research backend.
 #
 #   Short-press / Wake-word → Quick Chat
 #     The BRIDGE owns dispatch end-to-end: STT → local LLM → edge-tts → audio
-#     URL playback back to the Voice PE. Quick Chat survives the cloud / .115
-#     being down (local LLM + local TTS), but requires the bridge to be alive.
+#     URL playback back to the Voice PE. Quick Chat survives the cloud /
+#     research backend being down (local LLM + local TTS), but requires the
+#     bridge to be alive.
 #     Double-press additionally arms a photo-augmented Quick Chat: the next
 #     utterance triggers a 3-2-1 countdown TTS, a JPEG snapshot capture from
 #     the configured CAMERA_SNAPSHOT_URL, and a multimodal LLM call.
 #
 # This asymmetry is INTENTIONAL — each path is matched to its workload's
-# reliability vs. flexibility profile. See bridge module docstring at
-# REDACTED_PATH/
-# voice_pe_research_bridge.py for the architectural rationale.
+# reliability vs. flexibility profile. See the research-bridge module
+# docstring for the architectural rationale.
 # ==============================================================================
 substitutions:
   # Phases of the Voice Assistant
@@ -41,6 +40,11 @@ substitutions:
   voice_assist_error_phase_id: '11'
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
+  # Internal research/quick-chat endpoints — values kept in gitignored secrets.yaml
+  # so internal network topology is not committed to the public repo.
+  quickchat_base: !secret quickchat_base
+  bridge_base: !secret bridge_base
+  research_base: !secret research_base
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
   jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
@@ -432,7 +436,7 @@ binary_sensor:
                                                   announcement: true
                                               - media_player.play_media:
                                                   id: external_media_player
-                                                  media_url: "http://REDACTED_IP:6060/quick-chat-static/quick_chat_prompt.mp3"
+                                                  media_url: "${quickchat_base}/quick-chat-static/quick_chat_prompt.mp3"
                                                   announcement: true
                                               - delay: 300ms
                                               - wait_until:
@@ -465,12 +469,12 @@ binary_sensor:
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
-                # Local camera workflow trigger on pai. This preserves the normal
+                # Local camera workflow trigger on the bridge host. This preserves the normal
                 # Home Assistant event while giving the physical double-click a
                 # direct LAN fallback even when HA entity state is unavailable.
                 - lambda: |-
                     esp_http_client_config_t config = {};
-                    config.url = "http://REDACTED_IP:8900/button";
+                    config.url = "${bridge_base}/button";
                     config.method = HTTP_METHOD_POST;
                     config.timeout_ms = 1500;
                     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -519,7 +523,7 @@ binary_sensor:
                     id: button_press_event
                     event_type: "long_press"
                 # Research capture: ask the prompt, then start one STT run. The
-                # on_stt_end hook below posts the transcript to .115.
+                # on_stt_end hook below posts the transcript to the research backend.
                 - if:
                     condition:
                       and:
@@ -537,7 +541,7 @@ binary_sensor:
                           announcement: true
                       - media_player.play_media:
                           id: external_media_player
-                          media_url: "http://REDACTED_IP:8895/static/research_prompt.mp3"
+                          media_url: "${research_base}/static/research_prompt.mp3"
                           announcement: true
                       - delay: 500ms
                       - wait_until:
@@ -1992,7 +1996,7 @@ micro_wake_word:
                                       announcement: true
                                   - media_player.play_media:
                                       id: external_media_player
-                                      media_url: "http://REDACTED_IP:6060/quick-chat-static/quick_chat_wake.mp3"
+                                      media_url: "${quickchat_base}/quick-chat-static/quick_chat_wake.mp3"
                                       announcement: true
                                   - delay: 350ms
                                   - wait_until:
@@ -2110,11 +2114,11 @@ voice_assistant:
         then:
           - lambda: |-
               // Long-press research dispatch (asymmetric resilience pattern).
-              // Try the bridge proxy at REDACTED_ENDPOINT/research FIRST with a short
-              // timeout — when the bridge is up, this lets it observe / enrich
-              // the request. On any failure (timeout, non-2xx, ESP error) fall
-              // back to a direct POST to .115 so research dispatch survives the
-              // bridge being down. See bridge module docstring for rationale.
+              // Try the bridge proxy FIRST with a short timeout — when the
+              // bridge is up, this lets it observe / enrich the request. On any
+              // failure (timeout, non-2xx, ESP error) fall back to a direct POST
+              // to the research backend so research dispatch survives the bridge
+              // being down. See research-bridge module docstring for rationale.
               id(research_capture_requested) = false;
               std::string transcript = x;
               ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
@@ -2133,9 +2137,9 @@ voice_assistant:
               }
               std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
 
-              // Attempt 1: bridge proxy on REDACTED_ENDPOINT/research, short timeout.
+              // Attempt 1: bridge proxy, short timeout.
               esp_http_client_config_t bridge_config = {};
-              bridge_config.url = "http://REDACTED_IP:8900/research";
+              bridge_config.url = "${bridge_base}/research";
               bridge_config.method = HTTP_METHOD_POST;
               bridge_config.timeout_ms = 800;
               esp_http_client_handle_t bridge_client = esp_http_client_init(&bridge_config);
@@ -2150,14 +2154,14 @@ voice_assistant:
                 esp_http_client_cleanup(bridge_client);
               }
 
-              // Attempt 2 (fallback): direct POST to .115 if the bridge errored
-              // or returned non-2xx. We accept ANY 2xx from the bridge as a
-              // successful dispatch (bridge has already forwarded to .115).
+              // Attempt 2 (fallback): direct POST to the research backend if the
+              // bridge errored or returned non-2xx. We accept ANY 2xx from the
+              // bridge as a successful dispatch (bridge has already forwarded on).
               bool bridge_ok = (bridge_err == ESP_OK) && (bridge_status >= 200) && (bridge_status < 300);
               if (!bridge_ok) {
-                ESP_LOGW("research_webhook", "bridge proxy unavailable (err=%s status=%d); falling back to direct .115 POST", esp_err_to_name(bridge_err), bridge_status);
+                ESP_LOGW("research_webhook", "bridge proxy unavailable (err=%s status=%d); falling back to direct research-backend POST", esp_err_to_name(bridge_err), bridge_status);
                 esp_http_client_config_t fallback_config = {};
-                fallback_config.url = "http://REDACTED_IP:8895/api/voice-pe/research";
+                fallback_config.url = "${research_base}/api/voice-pe/research";
                 fallback_config.method = HTTP_METHOD_POST;
                 fallback_config.timeout_ms = 3000;
                 esp_http_client_handle_t fallback_client = esp_http_client_init(&fallback_config);
@@ -2166,7 +2170,7 @@ voice_assistant:
                   esp_http_client_set_post_field(fallback_client, body.c_str(), body.length());
                   esp_err_t err = esp_http_client_perform(fallback_client);
                   int status = esp_http_client_get_status_code(fallback_client);
-                  ESP_LOGI("research_webhook", "direct .115 fallback POST: %s http_status=%d", esp_err_to_name(err), status);
+                  ESP_LOGI("research_webhook", "direct research-backend fallback POST: %s http_status=%d", esp_err_to_name(err), status);
                   esp_http_client_cleanup(fallback_client);
                 } else {
                   ESP_LOGW("research_webhook", "failed to initialize fallback research webhook client");
@@ -2174,7 +2178,7 @@ voice_assistant:
               }
           - media_player.play_media:
               id: external_media_player
-              media_url: "http://REDACTED_IP:8895/static/research_started.mp3"
+              media_url: "${research_base}/static/research_started.mp3"
               announcement: true
           - voice_assistant.stop:
         # Quick Chat: single-press transcripts go to the bridge for
@@ -2209,7 +2213,7 @@ voice_assistant:
               }
               std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"text\":\"" + escaped + "\"}";
               esp_http_client_config_t config = {};
-              config.url = "http://REDACTED_IP:6060/quick-chat";
+              config.url = "${quickchat_base}/quick-chat";
               config.method = HTTP_METHOD_POST;
               config.timeout_ms = 1500;
               esp_http_client_handle_t client = esp_http_client_init(&config);
