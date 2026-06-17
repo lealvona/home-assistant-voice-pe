@@ -68,6 +68,10 @@ esphome:
   friendly_name: Home Assistant Voice
   name_add_mac_suffix: true
   min_version: 2026.5.0
+  # Non-blocking LAN dispatch helpers (research / quick-chat / camera POSTs run
+  # on short-lived worker tasks so the main loop never stalls on the network).
+  includes:
+    - voice_dispatch.h
   on_boot:
     priority: 375
     then:
@@ -473,21 +477,8 @@ binary_sensor:
                 # Home Assistant event while giving the physical double-click a
                 # direct LAN fallback even when HA entity state is unavailable.
                 - lambda: |-
-                    esp_http_client_config_t config = {};
-                    config.url = "${bridge_base}/button";
-                    config.method = HTTP_METHOD_POST;
-                    config.timeout_ms = 1500;
-                    esp_http_client_handle_t client = esp_http_client_init(&config);
-                    if (client != nullptr) {
-                      std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"double_press\"}";
-                      esp_http_client_set_header(client, "Content-Type", "application/json");
-                      esp_http_client_set_post_field(client, body.c_str(), body.length());
-                      esp_err_t err = esp_http_client_perform(client);
-                      ESP_LOGI("camera_webhook", "camera webhook POST result: %s", esp_err_to_name(err));
-                      esp_http_client_cleanup(client);
-                    } else {
-                      ESP_LOGW("camera_webhook", "failed to initialize camera webhook client");
-                    }
+                    std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"double_press\"}";
+                    voice_dispatch::post_async("${bridge_base}/button", body, 1500, "camera_webhook");
       # Triple Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -1199,14 +1190,28 @@ script:
           condition:
             lambda: return id(quick_chat_pending);
           then:
-            - lambda: |-
-                ESP_LOGW("quick_chat", "quick chat timed out waiting for final response; showing LED error");
-                id(quick_chat_pending) = false;
-                id(quick_chat_expecting_announcement) = false;
-                id(quick_chat_announcement_count) = 0;
-                id(voice_assistant_phase) = ${voice_assist_error_phase_id};
-            - script.execute: control_leds
-            - delay: 3s
+            - lambda: ESP_LOGW("quick_chat", "quick chat timed out waiting for final response; showing LED error");
+            - script.execute: quick_chat_show_error
+
+  # Reset quick-chat state, flash the error LED, then return to idle after a
+  # short dwell. Shared by the 90s response timeout and the (async) POST-failure
+  # path so both clear state identically and neither leaves the error LED stuck.
+  # The idle reset is guarded so a new quick-chat started during the dwell is not
+  # stomped.
+  - id: quick_chat_show_error
+    mode: restart
+    then:
+      - lambda: |-
+          id(quick_chat_pending) = false;
+          id(quick_chat_expecting_announcement) = false;
+          id(quick_chat_announcement_count) = 0;
+          id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+      - script.execute: control_leds
+      - delay: 3s
+      - if:
+          condition:
+            lambda: 'return id(voice_assistant_phase) == ${voice_assist_error_phase_id};'
+          then:
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
 
@@ -2032,6 +2037,23 @@ select:
           format: "Wake word sensitivity preset selected: %s; custom models keep their model defaults"
           args: ["x.c_str()"]
 
+# Surface a failed quick-chat POST on the main loop. The POST runs on a worker
+# task (voice_dispatch.h); on failure it tags an atomic with its generation,
+# which this interval polls. We act only if the failure belongs to the live
+# quick-chat generation, so a superseded press can't disturb the current
+# session. All LED/state changes happen here, on the main loop.
+interval:
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              int g = voice_dispatch::take_quickchat_failure_gen();
+              return g >= 0 && g == id(quick_chat_generation);
+          then:
+            - lambda: ESP_LOGW("quick_chat", "quick-chat POST failed; showing LED error");
+            - script.execute: quick_chat_show_error
+
 voice_assistant:
   id: va
   microphone:
@@ -2114,11 +2136,10 @@ voice_assistant:
         then:
           - lambda: |-
               // Long-press research dispatch (asymmetric resilience pattern).
-              // Try the bridge proxy FIRST with a short timeout — when the
-              // bridge is up, this lets it observe / enrich the request. On any
-              // failure (timeout, non-2xx, ESP error) fall back to a direct POST
-              // to the research backend so research dispatch survives the bridge
-              // being down. See research-bridge module docstring for rationale.
+              // The worker task tries the bridge proxy FIRST with a short
+              // timeout, then falls back to a direct POST to the research
+              // backend so dispatch survives the bridge being down. The POSTs
+              // run off the main loop (see voice_dispatch.h).
               id(research_capture_requested) = false;
               std::string transcript = x;
               ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
@@ -2126,56 +2147,11 @@ voice_assistant:
                 ESP_LOGW("research_webhook", "research capture had empty transcript");
                 return;
               }
-              std::string escaped;
-              escaped.reserve(transcript.size() + 64);
-              for (char c : transcript) {
-                if (c == '\\') escaped += "\\\\";
-                else if (c == '"') escaped += "\\\"";
-                else if (c == '\n') escaped += "\\n";
-                else if (c == '\r') escaped += "\\r";
-                else escaped += c;
-              }
-              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"long_press_research\",\"text\":\"" + escaped + "\"}";
-
-              // Attempt 1: bridge proxy, short timeout.
-              esp_http_client_config_t bridge_config = {};
-              bridge_config.url = "${bridge_base}/research";
-              bridge_config.method = HTTP_METHOD_POST;
-              bridge_config.timeout_ms = 800;
-              esp_http_client_handle_t bridge_client = esp_http_client_init(&bridge_config);
-              esp_err_t bridge_err = ESP_FAIL;
-              int bridge_status = 0;
-              if (bridge_client != nullptr) {
-                esp_http_client_set_header(bridge_client, "Content-Type", "application/json");
-                esp_http_client_set_post_field(bridge_client, body.c_str(), body.length());
-                bridge_err = esp_http_client_perform(bridge_client);
-                bridge_status = esp_http_client_get_status_code(bridge_client);
-                ESP_LOGI("research_webhook", "bridge proxy POST: %s http_status=%d", esp_err_to_name(bridge_err), bridge_status);
-                esp_http_client_cleanup(bridge_client);
-              }
-
-              // Attempt 2 (fallback): direct POST to the research backend if the
-              // bridge errored or returned non-2xx. We accept ANY 2xx from the
-              // bridge as a successful dispatch (bridge has already forwarded on).
-              bool bridge_ok = (bridge_err == ESP_OK) && (bridge_status >= 200) && (bridge_status < 300);
-              if (!bridge_ok) {
-                ESP_LOGW("research_webhook", "bridge proxy unavailable (err=%s status=%d); falling back to direct research-backend POST", esp_err_to_name(bridge_err), bridge_status);
-                esp_http_client_config_t fallback_config = {};
-                fallback_config.url = "${research_base}/api/voice-pe/research";
-                fallback_config.method = HTTP_METHOD_POST;
-                fallback_config.timeout_ms = 3000;
-                esp_http_client_handle_t fallback_client = esp_http_client_init(&fallback_config);
-                if (fallback_client != nullptr) {
-                  esp_http_client_set_header(fallback_client, "Content-Type", "application/json");
-                  esp_http_client_set_post_field(fallback_client, body.c_str(), body.length());
-                  esp_err_t err = esp_http_client_perform(fallback_client);
-                  int status = esp_http_client_get_status_code(fallback_client);
-                  ESP_LOGI("research_webhook", "direct research-backend fallback POST: %s http_status=%d", esp_err_to_name(err), status);
-                  esp_http_client_cleanup(fallback_client);
-                } else {
-                  ESP_LOGW("research_webhook", "failed to initialize fallback research webhook client");
-                }
-              }
+              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                                 "\",\"event\":\"long_press_research\",\"text\":\"" +
+                                 voice_dispatch::json_escape(transcript) + "\"}";
+              voice_dispatch::research_async("${bridge_base}/research",
+                                             "${research_base}/api/voice-pe/research", body);
           - media_player.play_media:
               id: external_media_player
               media_url: "${research_base}/static/research_started.mp3"
@@ -2202,42 +2178,13 @@ voice_assistant:
               id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
               id(control_leds).execute();
               id(quick_chat_timeout).execute();
-              std::string escaped;
-              escaped.reserve(transcript.size() + 64);
-              for (char c : transcript) {
-                if (c == '\\') escaped += "\\\\";
-                else if (c == '"') escaped += "\\\"";
-                else if (c == '\n') escaped += "\\n";
-                else if (c == '\r') escaped += "\\r";
-                else escaped += c;
-              }
-              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"text\":\"" + escaped + "\"}";
-              esp_http_client_config_t config = {};
-              config.url = "${quickchat_base}/quick-chat";
-              config.method = HTTP_METHOD_POST;
-              config.timeout_ms = 1500;
-              esp_http_client_handle_t client = esp_http_client_init(&config);
-              if (client != nullptr) {
-                esp_http_client_set_header(client, "Content-Type", "application/json");
-                esp_http_client_set_post_field(client, body.c_str(), body.length());
-                esp_err_t err = esp_http_client_perform(client);
-                int status = esp_http_client_get_status_code(client);
-                ESP_LOGI("quick_chat", "quick-chat POST result: %s http_status=%d", esp_err_to_name(err), status);
-                if (err != ESP_OK || status < 200 || status >= 300) {
-                  ESP_LOGW("quick_chat", "quick-chat POST failed; showing LED error");
-                  id(quick_chat_pending) = false;
-                  id(quick_chat_announcement_count) = 0;
-                  id(voice_assistant_phase) = ${voice_assist_error_phase_id};
-                  id(control_leds).execute();
-                }
-                esp_http_client_cleanup(client);
-              } else {
-                ESP_LOGW("quick_chat", "failed to initialize quick-chat HTTP client");
-                id(quick_chat_pending) = false;
-                id(quick_chat_announcement_count) = 0;
-                id(voice_assistant_phase) = ${voice_assist_error_phase_id};
-                id(control_leds).execute();
-              }
+              // POST runs on a worker task; a failure (for THIS generation) is
+              // surfaced to the main loop via take_quickchat_failure_gen(),
+              // polled by the interval below.
+              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                                 "\",\"text\":\"" + voice_dispatch::json_escape(transcript) + "\"}";
+              voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                   id(quick_chat_generation));
   on_intent_progress:
     - if:
         condition:
