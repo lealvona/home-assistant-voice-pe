@@ -183,6 +183,14 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Consecutive 1s watchdog ticks during which the LEDs have shown a transient
+  # (active) phase with no actual activity. Used to force the ring back to
+  # idle/off so LEDs never run on past the end of a cycle (see the LED inactivity
+  # watchdog interval).
+  - id: led_idle_ticks
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Global initialization variable. Initialized to true and set to false once everything is connected. Only used to have a smooth "plugging" experience
   - id: init_in_progress
     type: bool
@@ -2053,6 +2061,40 @@ interval:
           then:
             - lambda: ESP_LOGW("quick_chat", "quick-chat POST failed; showing LED error");
             - script.execute: quick_chat_show_error
+
+  # LED inactivity watchdog: the LED state machine is event-driven, so a transient
+  # phase (waiting/listening/thinking/replying/error) can linger if its clearing
+  # event is missed. If we are in such a phase but nothing is actually happening
+  # (no VA run, no pending ask, no playback/announcement, no timer, no button/dial)
+  # for a few seconds, force the ring back to idle so the LEDs never run on with
+  # no activity.
+  - interval: 1s
+    then:
+      - lambda: |-
+          int p = id(voice_assistant_phase);
+          bool transient = (p == ${voice_assist_waiting_for_command_phase_id} ||
+                            p == ${voice_assist_listening_for_command_phase_id} ||
+                            p == ${voice_assist_thinking_phase_id} ||
+                            p == ${voice_assist_replying_phase_id} ||
+                            p == ${voice_assist_error_phase_id});
+          if (!transient) { id(led_idle_ticks) = 0; return; }
+          bool active = id(va).is_running()
+            || id(quick_chat_pending)
+            || id(research_capture_requested)
+            || id(timer_ringing).state
+            || id(center_button).state
+            || id(dial_touched)
+            || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING
+            || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          if (active) { id(led_idle_ticks) = 0; return; }
+          id(led_idle_ticks) += 1;
+          if (id(led_idle_ticks) >= 5) {
+            ESP_LOGW("led_watchdog", "no activity for %ds in transient LED phase %d; returning ring to idle",
+                     id(led_idle_ticks), p);
+            id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            id(led_idle_ticks) = 0;
+            id(control_leds).execute();
+          }
 
 voice_assistant:
   id: va
