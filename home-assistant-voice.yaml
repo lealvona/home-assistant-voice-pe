@@ -38,6 +38,14 @@ substitutions:
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
   voice_assist_error_phase_id: '11'
+  # Center-button capture modes — which dispatch the next STT result is routed to
+  # by on_stt_end. Single press -> direct, double -> agent, triple -> agent+camera,
+  # long press -> research. (See capture_mode global and on_multi_click.)
+  capture_mode_none: '0'
+  capture_mode_direct: '1'
+  capture_mode_agent: '2'
+  capture_mode_agent_photo: '3'
+  capture_mode_research: '4'
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
   # Internal research/quick-chat endpoints — values kept in gitignored secrets.yaml
@@ -221,11 +229,31 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  # Global variable tracking if the next STT result should be sent to Hermes research intake.
-  - id: research_capture_requested
+  # Center-button capture mode for the next STT result, set by the press handler:
+  # 0=none, 1=direct LLM, 2=Hermes agent, 3=agent+camera, 4=research.
+  # on_stt_end routes the transcript based on this value.
+  - id: capture_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # True while waiting for the user's spoken local/cloud answer (the clarification
+  # turn requested by the bridge). on_stt_end consumes it to tag the POST as a
+  # follow-up so the bridge routes the original question to the chosen target.
+  - id: awaiting_clarification
     type: bool
     restore_value: no
     initial_value: 'false'
+  # The original question + mode captured when a clarification turn starts, so
+  # the follow-up POST can re-send them. This makes the bridge's in-memory
+  # pending state a fallback, not a hard dependency (survives a bridge restart
+  # mid-clarification).
+  - id: clarify_orig_text
+    type: std::string
+    restore_value: no
+  - id: clarify_orig_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Global variable tracking if a quick-chat answer is still pending. Keeps LEDs purple
   # after STT finishes until the receipt/final answer plays or timeout/error fires.
   - id: quick_chat_pending
@@ -437,6 +465,7 @@ binary_sensor:
                                             then:
                                               - lambda: |-
                                                   ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
+                                                  id(capture_mode) = ${capture_mode_direct};
                                                   id(quick_chat_pending) = false;
                                                   id(quick_chat_expecting_announcement) = false;
                                                   id(quick_chat_announcement_count) = 0;
@@ -462,8 +491,10 @@ binary_sensor:
                                               - script.execute: control_leds
                                               - voice_assistant.start:
                                                   silence_detection: true
-      # Double Click
-      #  . Exposed as an event entity. To be used in automations inside Home Assistant
+      # Double Click -> quick ask to the Hermes AGENT (tools / web search / skills).
+      #   Plays the prompt, captures one spoken question, then on_stt_end posts it
+      #   to the :6060 bridge with mode=agent. The bridge picks local vs cloud
+      #   (inferred from the prompt, or asked). No Home Assistant event.
       - timing:
           - ON for at most 1s
           - OFF for at most 0.25s
@@ -475,20 +506,12 @@ binary_sensor:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
                 - script.execute:
-                    id: play_sound
-                    priority: false
-                    sound_file: "center_button_double_press_sound"
-                - event.trigger:
-                    id: button_press_event
-                    event_type: "double_press"
-                # Local camera workflow trigger on the bridge host. This preserves the normal
-                # Home Assistant event while giving the physical double-click a
-                # direct LAN fallback even when HA entity state is unavailable.
-                - lambda: |-
-                    std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) + "\",\"event\":\"double_press\"}";
-                    voice_dispatch::post_async("${bridge_base}/button", body, 1500, "camera_webhook");
-      # Triple Click
-      #  . Exposed as an event entity. To be used in automations inside Home Assistant
+                    id: quick_capture
+                    mode: ${capture_mode_agent}
+                    prompt_url: "${quickchat_base}/quick-chat-static/quick_chat_prompt.mp3"
+      # Triple Click -> Hermes AGENT + CAMERA. Same capture flow as double, but the
+      #   bridge also grabs a camera still (with Coral detection hints) and sends it
+      #   with the question to the multimodal agent. No Home Assistant event.
       - timing:
           - ON for at most 1s
           - OFF for at most 0.25s
@@ -502,9 +525,27 @@ binary_sensor:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
                 - script.execute:
-                    id: play_sound
-                    priority: false
-                    sound_file: "center_button_triple_press_sound"
+                    id: quick_capture
+                    mode: ${capture_mode_agent_photo}
+                    prompt_url: "${quickchat_base}/quick-chat-static/quick_chat_prompt.mp3"
+      # Quadruple Click -> Home Assistant event only (placeholder for a future HA
+      #   automation). Single/double/triple/long are all handled on-device through
+      #   the bridges; ONLY the quad press is relegated to Home Assistant. Fires the
+      #   legacy "triple_press" event type so any existing HA automation still works.
+      - timing:
+          - ON for at most 1s
+          - OFF for at most 0.25s
+          - ON for at most 1s
+          - OFF for at most 0.25s
+          - ON for at most 1s
+          - OFF for at most 0.25s
+          - ON for at most 1s
+          - OFF for at least 0.25s
+        then:
+          - if:
+              condition:
+                lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
+              then:
                 - event.trigger:
                     id: button_press_event
                     event_type: "triple_press"
@@ -532,7 +573,7 @@ binary_sensor:
                     then:
                       - lambda: |-
                           ESP_LOGI("research_webhook", "long-press research mode armed; playing prompt");
-                          id(research_capture_requested) = true;
+                          id(capture_mode) = ${capture_mode_research};
                           id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
                       - script.execute: control_leds
                       - media_player.stop:
@@ -1223,6 +1264,52 @@ script:
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             - script.execute: control_leds
 
+  # Arm a quick-ask capture: set the dispatch mode, play a prompt, then start one
+  # STT run. Shared by double-press (agent) and triple-press (agent+camera).
+  # on_stt_end reads capture_mode and posts the transcript to the :6060 bridge.
+  # Mirrors the single-press quick-chat arm in on_multi_click.
+  - id: quick_capture
+    parameters:
+      mode: int
+      prompt_url: string
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_off: master_mute_switch
+              - not: voice_assistant.is_running
+              - lambda: return id(va).get_api_connection() != nullptr;
+          then:
+            - lambda: |-
+                id(capture_mode) = mode;
+                id(quick_chat_pending) = false;
+                id(quick_chat_expecting_announcement) = false;
+                id(quick_chat_announcement_count) = 0;
+                id(quick_chat_generation) += 1;
+                id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+            - script.execute: control_leds
+            - media_player.stop:
+                id: external_media_player
+                announcement: true
+            - media_player.play_media:
+                id: external_media_player
+                media_url: !lambda return prompt_url;
+                announcement: true
+            - delay: 300ms
+            - wait_until:
+                condition:
+                  not:
+                    media_player.is_announcing:
+                      id: external_media_player
+                timeout: 5s
+            - delay: 150ms
+            - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+            - script.execute: control_leds
+            - voice_assistant.start:
+                silence_detection: true
+          else:
+            - lambda: 'ESP_LOGW("quick_chat", "quick_capture mode %d skipped (mute/running/no-api)", mode);'
+
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
@@ -1364,7 +1451,7 @@ script:
     then:
       - if:
           condition:
-            lambda: return id(research_capture_requested);
+            lambda: return id(capture_mode) == ${capture_mode_research};
           then:
             - light.turn_on:
                 brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.45f );
@@ -1388,7 +1475,7 @@ script:
     then:
       - if:
           condition:
-            lambda: return id(research_capture_requested);
+            lambda: return id(capture_mode) == ${capture_mode_research};
           then:
             - light.turn_on:
                 brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.35f );
@@ -2018,6 +2105,9 @@ micro_wake_word:
                                           media_player.is_announcing:
                                             id: external_media_player
                                       timeout: 1500ms
+                            # Wake-word quick chat uses the direct-LLM path (same
+                            # as a single press); on_stt_end reads capture_mode.
+                            - lambda: id(capture_mode) = ${capture_mode_direct};
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
                                 silence_detection: true
@@ -2061,6 +2151,33 @@ interval:
           then:
             - lambda: ESP_LOGW("quick_chat", "quick-chat POST failed; showing LED error");
             - script.execute: quick_chat_show_error
+      # Clarification turn: the bridge couldn't tell local vs cloud from the
+      # prompt and asked us (via {"status":"clarify"}) to capture a spoken
+      # local/cloud answer. Re-arm STT with the "Local, or cloud?" prompt; the
+      # next on_stt_end tags the POST clarify_followup so the bridge routes the
+      # original question. Only acts on the live generation.
+      - if:
+          condition:
+            lambda: |-
+              // Peek (don't consume) so we only claim the clarify once we can
+              // actually re-arm STT this tick — otherwise the signal would be
+              // lost with awaiting_clarification stranded true. If not ready
+              // (VA still stopping, muted, no API), leave it pending and retry
+              // next tick. quick_capture re-checks the same guard, and the main
+              // loop is single-threaded, so a pass here means it will arm.
+              if (voice_dispatch::peek_quickchat_clarify_gen() != id(quick_chat_generation)) return false;
+              if (id(master_mute_switch).state || id(va).is_running() ||
+                  id(va).get_api_connection() == nullptr) return false;
+              voice_dispatch::take_quickchat_clarify_gen();  // consume; we will arm now
+              return true;
+          then:
+            - lambda: |-
+                ESP_LOGI("quick_chat", "bridge requested local/cloud clarification; re-arming STT");
+                id(awaiting_clarification) = true;
+            - script.execute:
+                id: quick_capture
+                mode: ${capture_mode_direct}
+                prompt_url: "${quickchat_base}/quick-chat-static/quick_chat_clarify.mp3"
 
   # LED inactivity watchdog: the LED state machine is event-driven, so a transient
   # phase (waiting/listening/thinking/replying/error) can linger if its clearing
@@ -2080,7 +2197,7 @@ interval:
           if (!transient) { id(led_idle_ticks) = 0; return; }
           bool active = id(va).is_running()
             || id(quick_chat_pending)
-            || id(research_capture_requested)
+            || id(capture_mode) != ${capture_mode_none}
             || id(timer_ringing).state
             || id(center_button).state
             || id(dial_touched)
@@ -2124,10 +2241,11 @@ voice_assistant:
     - script.execute: control_leds
   on_error:
     - lambda: |-
-        if (id(research_capture_requested)) {
-          ESP_LOGW("research_webhook", "clearing research capture flag after voice assistant error: %s", code.c_str());
-          id(research_capture_requested) = false;
+        if (id(capture_mode) != ${capture_mode_none}) {
+          ESP_LOGW("research_webhook", "clearing capture mode %d after voice assistant error: %s", id(capture_mode), code.c_str());
+          id(capture_mode) = ${capture_mode_none};
         }
+        id(awaiting_clarification) = false;
     # Only set the error phase if the error code is different than duplicate_wake_up_detected or stt-no-text-recognized
     # These two are ignored for a better user experience
     - if:
@@ -2165,7 +2283,7 @@ voice_assistant:
     - script.execute: control_leds
     - if:
         condition:
-          lambda: return id(research_capture_requested);
+          lambda: return id(capture_mode) == ${capture_mode_research};
         then:
           - script.execute:
               id: play_sound
@@ -2174,7 +2292,7 @@ voice_assistant:
   on_stt_end:
     - if:
         condition:
-          lambda: return id(research_capture_requested);
+          lambda: return id(capture_mode) == ${capture_mode_research};
         then:
           - lambda: |-
               // Long-press research dispatch (asymmetric resilience pattern).
@@ -2182,7 +2300,7 @@ voice_assistant:
               // timeout, then falls back to a direct POST to the research
               // backend so dispatch survives the bridge being down. The POSTs
               // run off the main loop (see voice_dispatch.h).
-              id(research_capture_requested) = false;
+              id(capture_mode) = ${capture_mode_none};
               std::string transcript = x;
               ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
               if (transcript.empty()) {
@@ -2210,6 +2328,8 @@ voice_assistant:
                 id(quick_chat_pending) = false;
                 id(quick_chat_expecting_announcement) = false;
                 id(quick_chat_announcement_count) = 0;
+                id(awaiting_clarification) = false;
+                id(capture_mode) = ${capture_mode_none};
                 id(voice_assistant_phase) = ${voice_assist_error_phase_id};
                 return;
               }
@@ -2222,9 +2342,43 @@ voice_assistant:
               id(quick_chat_timeout).execute();
               // POST runs on a worker task; a failure (for THIS generation) is
               // surfaced to the main loop via take_quickchat_failure_gen(),
-              // polled by the interval below.
-              std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
-                                 "\",\"text\":\"" + voice_dispatch::json_escape(transcript) + "\"}";
+              // polled by the interval below. The "mode" tag tells the :6060
+              // bridge how to dispatch: direct LLM (single press) vs Hermes
+              // agent (double) vs agent+camera (triple). "photo":true asks the
+              // bridge to also capture a camera still for the multimodal agent.
+              // Consume the clarification flag: if set, this utterance is the
+              // user's spoken local/cloud answer to a prior "Local, or cloud?".
+              bool followup = id(awaiting_clarification);
+              id(awaiting_clarification) = false;
+              std::string transcript_esc = voice_dispatch::json_escape(transcript);
+              std::string body;
+              // clarify_capable tells the bridge this firmware can run a spoken
+              // local/cloud follow-up, so it may answer with {"status":"clarify"}.
+              if (followup) {
+                // Re-send the ORIGINAL question + mode/photo (saved when the
+                // clarification was requested) so recovery doesn't depend on the
+                // bridge's in-memory pending state. "text" is the local/cloud answer.
+                int om = id(clarify_orig_mode);
+                const char *omode = (om == ${capture_mode_agent} || om == ${capture_mode_agent_photo}) ? "agent" : "direct";
+                bool ophoto = (om == ${capture_mode_agent_photo});
+                body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                       "\",\"text\":\"" + transcript_esc +
+                       "\",\"mode\":\"" + std::string(omode) + "\",\"clarify_capable\":true,\"clarify_followup\":true" +
+                       ",\"orig_text\":\"" + voice_dispatch::json_escape(id(clarify_orig_text)) + "\"" +
+                       (ophoto ? ",\"photo\":true" : "") + "}";
+              } else {
+                int cm = id(capture_mode);
+                const char *mode = (cm == ${capture_mode_agent} || cm == ${capture_mode_agent_photo}) ? "agent" : "direct";
+                bool want_photo = (cm == ${capture_mode_agent_photo});
+                // Save in case the bridge asks us to clarify this question.
+                id(clarify_orig_mode) = cm;
+                id(clarify_orig_text) = transcript;
+                body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                       "\",\"text\":\"" + transcript_esc +
+                       "\",\"mode\":\"" + std::string(mode) + "\",\"clarify_capable\":true" +
+                       (want_photo ? ",\"photo\":true" : "") + "}";
+              }
+              id(capture_mode) = ${capture_mode_none};
               voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
                                                    id(quick_chat_generation));
   on_intent_progress:

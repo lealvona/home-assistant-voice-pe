@@ -43,9 +43,10 @@ inline std::atomic<int> &inflight() {
 }
 
 // Quick-chat POST result, packed as (generation << 2) | code, observed on the
-// main loop. code: 0 = pending, 1 = ok, 2 = failed. The generation tag lets the
-// main loop ignore a stale worker's result from a press that has since been
-// superseded (mirrors the quick_chat_active_generation guard used elsewhere).
+// main loop. code: 0 = pending, 1 = ok, 2 = failed, 3 = clarify (the bridge
+// needs a spoken local/cloud answer before it can dispatch). The generation tag
+// lets the main loop ignore a stale worker's result from a press that has since
+// been superseded (mirrors the quick_chat_active_generation guard used elsewhere).
 inline std::atomic<int> &qc_state() {
   static std::atomic<int> s{(-1 << 2)};  // generation -1, code 0 -> never a failure
   return s;
@@ -58,6 +59,31 @@ inline std::atomic<int> &qc_state() {
 inline int take_quickchat_failure_gen() {
   int s = qc_state().load();
   if ((s & 0x3) == 2) {
+    int gen = s >> 2;
+    int cleared = gen << 2;  // back to "pending" for this generation
+    qc_state().compare_exchange_strong(s, cleared);
+    return gen;
+  }
+  return -1;
+}
+
+// Non-destructive peek: returns the generation of a pending clarify (code 3)
+// without clearing it, else -1. Lets the poll interval check it can actually
+// re-arm STT BEFORE consuming the signal, so a momentary not-ready window
+// (VA still stopping, muted, API blip) can't strand the clarification with the
+// signal already gone.
+inline int peek_quickchat_clarify_gen() {
+  int s = qc_state().load();
+  return ((s & 0x3) == 3) ? (s >> 2) : -1;
+}
+
+// If the bridge asked for a local/cloud clarification (code 3), returns the
+// generation it belonged to (and clears the slot so it reports once); otherwise
+// -1. Mirrors take_quickchat_failure_gen so the main loop's poll interval can
+// re-arm STT for the follow-up answer without disturbing a superseded press.
+inline int take_quickchat_clarify_gen() {
+  int s = qc_state().load();
+  if ((s & 0x3) == 3) {
     int gen = s >> 2;
     int cleared = gen << 2;  // back to "pending" for this generation
     qc_state().compare_exchange_strong(s, cleared);
@@ -114,6 +140,51 @@ inline int do_post(const std::string &url, const std::string &body, uint32_t tim
   esp_http_client_cleanup(client);
   bool ok = (err == ESP_OK) && (status >= 200) && (status < 300);
   return ok ? status : -1;
+}
+
+// Like do_post, but captures up to 255 bytes of the response body into
+// `resp_out` (used by quick-chat to detect the bridge's {"status":"clarify"}
+// signal). Uses the manual open/write/fetch/read sequence because
+// esp_http_client_perform() discards the body. Returns the 2xx status, or a
+// negative value on transport error / non-2xx.
+inline int do_post_capture(const std::string &url, const std::string &body, uint32_t timeout_ms,
+                           const char *tag, std::string &resp_out) {
+  resp_out.clear();
+  esp_http_client_config_t cfg = {};
+  cfg.url = url.c_str();
+  cfg.method = HTTP_METHOD_POST;
+  cfg.timeout_ms = static_cast<int>(timeout_ms);
+  esp_http_client_handle_t client = esp_http_client_init(&cfg);
+  if (client == nullptr) {
+    ESP_LOGW(tag, "failed to init HTTP client");
+    return -1;
+  }
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+  esp_err_t err = esp_http_client_open(client, body.length());
+  if (err != ESP_OK) {
+    ESP_LOGW(tag, "open failed: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    return -1;
+  }
+  int wlen = esp_http_client_write(client, body.data(), body.length());
+  if (wlen < 0) {
+    ESP_LOGW(tag, "write failed");
+    esp_http_client_cleanup(client);
+    return -1;
+  }
+  esp_http_client_fetch_headers(client);
+  int status = esp_http_client_get_status_code(client);
+  char buf[256];
+  int total = 0;
+  while (total < static_cast<int>(sizeof(buf)) - 1) {
+    int r = esp_http_client_read(client, buf + total, sizeof(buf) - 1 - total);
+    if (r <= 0) break;
+    total += r;
+  }
+  resp_out.assign(buf, total > 0 ? total : 0);
+  ESP_LOGI(tag, "POST(capture): http_status=%d body_len=%d", status, total);
+  esp_http_client_cleanup(client);
+  return (status >= 200 && status < 300) ? status : -1;
 }
 
 // Spawn a worker task to run `fn(job)`, honouring the in-flight cap. Takes
@@ -200,8 +271,18 @@ struct QcJob {
 
 inline void qc_task(void *arg) {
   QcJob *job = static_cast<QcJob *>(arg);
-  int r = do_post(job->url, job->body, job->timeout_ms, "quick_chat");
-  int code = (r >= 0) ? 1 : 2;
+  std::string resp;
+  int r = do_post_capture(job->url, job->body, job->timeout_ms, "quick_chat", resp);
+  // code: 2 = transport/non-2xx failure, 3 = bridge wants a local/cloud
+  // clarification (body contains "clarify"), 1 = accepted/processing.
+  int code;
+  if (r < 0) {
+    code = 2;
+  } else if (resp.find("clarify") != std::string::npos) {
+    code = 3;
+  } else {
+    code = 1;
+  }
   // Only record our result if this generation still owns the slot — if a newer
   // press has taken over, expected won't match and the store is dropped.
   int expected = job->generation << 2;  // "pending" for our generation
