@@ -260,6 +260,13 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # millis() when quick_chat_pending last became true. The LED watchdog uses it
+  # to hard-cap the spinning "thinking" phase so it can never get stuck on
+  # forever if the answer never plays / the announcement count never completes.
+  - id: quick_chat_pending_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # True only during quick-chat announcement sequences (receipt + final answer).
   # Prevents research completion announcements from corrupting the count.
   - id: quick_chat_expecting_announcement
@@ -2195,19 +2202,40 @@ interval:
                             p == ${voice_assist_replying_phase_id} ||
                             p == ${voice_assist_error_phase_id});
           if (!transient) { id(led_idle_ticks) = 0; return; }
+          bool media_busy = id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING
+                         || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          // Hard cap on the spinning "thinking" phase. The announcement counter
+          // that normally clears it assumes exactly 2 announcements; an empty
+          // reply (no answer), a failed search, or extra progress cues can leave
+          // quick_chat_pending stuck true and the ring spinning forever. If it's
+          // been pending too long and nothing is actually playing, force idle.
+          bool pending_fresh = id(quick_chat_pending) && (millis() - id(quick_chat_pending_since) < 22000);
+          if (id(quick_chat_pending) && !pending_fresh && !media_busy) {
+            ESP_LOGW("led_watchdog", "quick-chat thinking exceeded cap; clearing stuck spinner");
+            id(quick_chat_pending) = false;
+            id(quick_chat_expecting_announcement) = false;
+            id(quick_chat_announcement_count) = 0;
+            id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            id(led_idle_ticks) = 0;
+            id(control_leds).execute();
+            return;
+          }
           bool active = id(va).is_running()
-            || id(quick_chat_pending)
+            || pending_fresh
             || id(capture_mode) != ${capture_mode_none}
             || id(timer_ringing).state
             || id(center_button).state
             || id(dial_touched)
-            || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING
-            || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+            || media_busy;
           if (active) { id(led_idle_ticks) = 0; return; }
           id(led_idle_ticks) += 1;
           if (id(led_idle_ticks) >= 5) {
             ESP_LOGW("led_watchdog", "no activity for %ds in transient LED phase %d; returning ring to idle",
                      id(led_idle_ticks), p);
+            // Clear any lingering quick-chat state so it can't leak to the next turn.
+            id(quick_chat_pending) = false;
+            id(quick_chat_expecting_announcement) = false;
+            id(quick_chat_announcement_count) = 0;
             id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             id(led_idle_ticks) = 0;
             id(control_leds).execute();
@@ -2358,6 +2386,7 @@ voice_assistant:
                 // (triple). "photo":true asks for a camera still. A failure is
                 // surfaced via take_quickchat_failure_gen(), polled below.
                 id(quick_chat_pending) = true;
+                id(quick_chat_pending_since) = millis();
                 id(quick_chat_expecting_announcement) = true;
                 id(quick_chat_active_generation) = id(quick_chat_generation);
                 id(quick_chat_announcement_count) = 0;
