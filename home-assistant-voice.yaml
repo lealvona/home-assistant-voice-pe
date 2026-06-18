@@ -1801,26 +1801,22 @@ script:
               id: external_media_player
           timeout: 5s
       - delay: 1s
-      # The stock firmware temporarily enabled the built-in `stop` wake word
-      # here. This fleet supports arbitrary per-device wake-word lists, so the
-      # stop model may not be present. Keep the timing behavior, but do not
-      # reference a model ID that may not exist.
+      # Enable the transient "Stop" barge-in word for the rest of the answer
+      # playback, then disable it again so it isn't an always-on word. The 1s
+      # delay above skips the answer's opening word — the announcement channel
+      # is NOT ducked and the XU316 AEC doesn't cancel the device's own TTS, so
+      # the model hears the answer at full volume; the delay + a distinctive
+      # word keep self-triggering low.
       - if:
           condition:
             switch.is_off: timer_ringing
           then:
+            - micro_wake_word.enable_model: stop
             - wait_until:
                 not:
                   media_player.is_announcing:
                     id: external_media_player
-            - if:
-                condition:
-                  switch.is_off: timer_ringing
-                then:
-                  - logger.log:
-                      tag: voice_assistant
-                      level: DEBUG
-                      format: "Announcement finished; no temporary stop model configured"
+            - micro_wake_word.disable_model: stop
 
 i2s_audio:
   - id: i2s_output
@@ -2055,6 +2051,13 @@ micro_wake_word:
       id: mister_carson
     - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWords/janet.json
       id: janet
+    # Transient "Stop" barge-in word. Disabled by default (only model index 0 is
+    # enabled on boot; state persists to flash) and kept out of the user-facing
+    # wake-word UI via internal:true. activate_stop_word_once enables it ONLY
+    # while the device is speaking an answer, so saying "stop" cuts off the reply.
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
   vad:
   on_wake_word_detected:
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
@@ -2085,6 +2088,17 @@ micro_wake_word:
                             - media_player.stop:
                                 announcement: true
                                 id: external_media_player
+                            # Barge-in: the user said "stop" (or a wake word)
+                            # while an answer was playing. Stopping the audio is
+                            # local; also tell the :6060 bridge to TERMINATE so it
+                            # bumps its generation and suppresses the pending
+                            # continue re-arm (otherwise the device would re-listen
+                            # when the answer would have finished). Dead stop.
+                            - lambda: |-
+                                std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                                                   "\",\"text\":\"stop\",\"barge\":true}";
+                                voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                                     id(quick_chat_generation));
                           # Start the voice assistant. When wake_sound is on,
                           # play a context-relevant verbal greeting served by
                           # the bridge ("Yes?") instead of the generic chime —
