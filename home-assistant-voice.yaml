@@ -87,6 +87,12 @@ esphome:
       - script.execute: control_leds
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
+      # Force the transient "Stop" barge-in word OFF at boot. Its enabled state
+      # persists to flash, so if a reboot/crash/OTA happened mid-answer (after
+      # activate_stop_word_once enabled it but before it disabled it), "stop"
+      # would otherwise come back as an always-on idle wake word. It is re-enabled
+      # on demand at the start of every answer, so disabling here is safe.
+      - micro_wake_word.disable_model: stop
       # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
       - delay: 10min
       - if:
@@ -1814,10 +1820,16 @@ script:
             switch.is_off: timer_ringing
           then:
             - micro_wake_word.enable_model: stop
+            # Bounded wait so disable_model ALWAYS runs even if the announcing
+            # state never clears (a clip that never finishes, a lost event) —
+            # otherwise the stop word could be left enabled. on_boot also disables
+            # it as a backstop against a reboot inside this window.
             - wait_until:
-                not:
-                  media_player.is_announcing:
-                    id: external_media_player
+                condition:
+                  not:
+                    media_player.is_announcing:
+                      id: external_media_player
+                timeout: 60s
             - micro_wake_word.disable_model: stop
 
 i2s_audio:
@@ -2092,15 +2104,22 @@ micro_wake_word:
                                 id: external_media_player
                             # Barge-in: the user said "stop" (or a wake word)
                             # while an answer was playing. Stopping the audio is
-                            # local; also tell the :6060 bridge to TERMINATE so it
-                            # bumps its generation and suppresses the pending
-                            # continue re-arm (otherwise the device would re-listen
-                            # when the answer would have finished). Dead stop.
-                            - lambda: |-
-                                std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
-                                                   "\",\"text\":\"stop\",\"barge\":true}";
-                                voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
-                                                                     id(quick_chat_generation));
+                            # local (above); also tell the :6060 bridge to TERMINATE
+                            # so it bumps its generation and suppresses the pending
+                            # continue re-arm. BUT only when a quick-chat is actually
+                            # in flight (receipt/thinking/answer) — guarded by
+                            # quick_chat_pending — so interrupting a non-chat
+                            # announcement (research prompt, wake greeting) doesn't
+                            # fire a spurious barge-cancel. Dead stop.
+                            - if:
+                                condition:
+                                  lambda: return id(quick_chat_pending);
+                                then:
+                                  - lambda: |-
+                                      std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                                                         "\",\"text\":\"stop\",\"barge\":true}";
+                                      voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                                           id(quick_chat_generation));
                           # Start the voice assistant. When wake_sound is on,
                           # play a context-relevant verbal greeting served by
                           # the bridge ("Yes?") instead of the generic chime —
