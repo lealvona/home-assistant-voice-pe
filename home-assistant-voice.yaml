@@ -2295,28 +2295,28 @@ voice_assistant:
           lambda: return id(capture_mode) == ${capture_mode_research};
         then:
           - lambda: |-
-              // Long-press research dispatch (asymmetric resilience pattern).
-              // The worker task tries the bridge proxy FIRST with a short
-              // timeout, then falls back to a direct POST to the research
-              // backend so dispatch survives the bridge being down. The POSTs
-              // run off the main loop (see voice_dispatch.h).
+              // Long-press research: route through the clarify-capable bridge
+              // path (mode=research). The bridge infers local vs cloud, asks
+              // "Local, or cloud?" when unclear, then submits to research-asks
+              // and plays the start confirmation. No quick_chat pending/timeout
+              // (research completes asynchronously; the completion watcher
+              // announces the result). voice_dispatch.h reads the clarify signal.
               id(capture_mode) = ${capture_mode_none};
+              id(awaiting_clarification) = false;
               std::string transcript = x;
               ESP_LOGI("research_webhook", "research STT ended; transcript length=%u", (unsigned) transcript.size());
               if (transcript.empty()) {
                 ESP_LOGW("research_webhook", "research capture had empty transcript");
                 return;
               }
+              // Saved so a clarify follow-up can re-route the ORIGINAL ask.
+              id(clarify_orig_mode) = ${capture_mode_research};
+              id(clarify_orig_text) = transcript;
               std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
-                                 "\",\"event\":\"long_press_research\",\"text\":\"" +
-                                 voice_dispatch::json_escape(transcript) + "\"}";
-              voice_dispatch::research_async("${bridge_base}/research",
-                                             "${research_base}/api/voice-pe/research", body);
-          - media_player.play_media:
-              id: external_media_player
-              media_url: "${research_base}/static/research_started.mp3"
-              announcement: true
-          - voice_assistant.stop:
+                                 "\",\"text\":\"" + voice_dispatch::json_escape(transcript) +
+                                 "\",\"mode\":\"research\",\"clarify_capable\":true}";
+              voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                   id(quick_chat_generation));
         # Quick Chat: single-press transcripts go to the bridge for
         # immediate LLM query + TTS playback.
         else:
@@ -2333,50 +2333,60 @@ voice_assistant:
                 id(voice_assistant_phase) = ${voice_assist_error_phase_id};
                 return;
               }
-              id(quick_chat_pending) = true;
-              id(quick_chat_expecting_announcement) = true;
-              id(quick_chat_active_generation) = id(quick_chat_generation);
-              id(quick_chat_announcement_count) = 0;
-              id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
-              id(control_leds).execute();
-              id(quick_chat_timeout).execute();
-              // POST runs on a worker task; a failure (for THIS generation) is
-              // surfaced to the main loop via take_quickchat_failure_gen(),
-              // polled by the interval below. The "mode" tag tells the :6060
-              // bridge how to dispatch: direct LLM (single press) vs Hermes
-              // agent (double) vs agent+camera (triple). "photo":true asks the
-              // bridge to also capture a camera still for the multimodal agent.
               // Consume the clarification flag: if set, this utterance is the
               // user's spoken local/cloud answer to a prior "Local, or cloud?".
               bool followup = id(awaiting_clarification);
               id(awaiting_clarification) = false;
+              // The effective original mode. Research follow-ups arrive here too
+              // (the clarify re-arm runs as a quick-chat capture), identified by
+              // clarify_orig_mode == research.
+              int omode_int = followup ? id(clarify_orig_mode) : id(capture_mode);
+              bool is_research = (omode_int == ${capture_mode_research});
               std::string transcript_esc = voice_dispatch::json_escape(transcript);
               std::string body;
-              // clarify_capable tells the bridge this firmware can run a spoken
-              // local/cloud follow-up, so it may answer with {"status":"clarify"}.
-              if (followup) {
-                // Re-send the ORIGINAL question + mode/photo (saved when the
-                // clarification was requested) so recovery doesn't depend on the
-                // bridge's in-memory pending state. "text" is the local/cloud answer.
-                int om = id(clarify_orig_mode);
-                const char *omode = (om == ${capture_mode_agent} || om == ${capture_mode_agent_photo}) ? "agent" : "direct";
-                bool ophoto = (om == ${capture_mode_agent_photo});
+              if (is_research) {
+                // Research clarify follow-up: the answer routes the ORIGINAL
+                // research ask. No quick_chat pending/timeout — research is async.
                 body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
                        "\",\"text\":\"" + transcript_esc +
-                       "\",\"mode\":\"" + std::string(omode) + "\",\"clarify_capable\":true,\"clarify_followup\":true" +
-                       ",\"orig_text\":\"" + voice_dispatch::json_escape(id(clarify_orig_text)) + "\"" +
-                       (ophoto ? ",\"photo\":true" : "") + "}";
+                       "\",\"mode\":\"research\",\"clarify_capable\":true,\"clarify_followup\":true" +
+                       ",\"orig_text\":\"" + voice_dispatch::json_escape(id(clarify_orig_text)) + "\"}";
               } else {
-                int cm = id(capture_mode);
-                const char *mode = (cm == ${capture_mode_agent} || cm == ${capture_mode_agent_photo}) ? "agent" : "direct";
-                bool want_photo = (cm == ${capture_mode_agent_photo});
-                // Save in case the bridge asks us to clarify this question.
-                id(clarify_orig_mode) = cm;
-                id(clarify_orig_text) = transcript;
-                body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
-                       "\",\"text\":\"" + transcript_esc +
-                       "\",\"mode\":\"" + std::string(mode) + "\",\"clarify_capable\":true" +
-                       (want_photo ? ",\"photo\":true" : "") + "}";
+                // Quick chat: purple "thinking" + 90s timeout while the bridge
+                // answers. The "mode" tag tells the :6060 bridge how to dispatch:
+                // direct LLM (single) vs Hermes agent (double) vs agent+camera
+                // (triple). "photo":true asks for a camera still. A failure is
+                // surfaced via take_quickchat_failure_gen(), polled below.
+                id(quick_chat_pending) = true;
+                id(quick_chat_expecting_announcement) = true;
+                id(quick_chat_active_generation) = id(quick_chat_generation);
+                id(quick_chat_announcement_count) = 0;
+                id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+                id(control_leds).execute();
+                id(quick_chat_timeout).execute();
+                if (followup) {
+                  // Re-send the ORIGINAL question + mode/photo (saved at clarify
+                  // time) so recovery doesn't depend on bridge in-memory state.
+                  int om = id(clarify_orig_mode);
+                  const char *omode = (om == ${capture_mode_agent} || om == ${capture_mode_agent_photo}) ? "agent" : "direct";
+                  bool ophoto = (om == ${capture_mode_agent_photo});
+                  body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                         "\",\"text\":\"" + transcript_esc +
+                         "\",\"mode\":\"" + std::string(omode) + "\",\"clarify_capable\":true,\"clarify_followup\":true" +
+                         ",\"orig_text\":\"" + voice_dispatch::json_escape(id(clarify_orig_text)) + "\"" +
+                         (ophoto ? ",\"photo\":true" : "") + "}";
+                } else {
+                  int cm = id(capture_mode);
+                  const char *mode = (cm == ${capture_mode_agent} || cm == ${capture_mode_agent_photo}) ? "agent" : "direct";
+                  bool want_photo = (cm == ${capture_mode_agent_photo});
+                  // Save in case the bridge asks us to clarify this question.
+                  id(clarify_orig_mode) = cm;
+                  id(clarify_orig_text) = transcript;
+                  body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                         "\",\"text\":\"" + transcript_esc +
+                         "\",\"mode\":\"" + std::string(mode) + "\",\"clarify_capable\":true" +
+                         (want_photo ? ",\"photo\":true" : "") + "}";
+                }
               }
               id(capture_mode) = ${capture_mode_none};
               voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
