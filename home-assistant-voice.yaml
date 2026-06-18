@@ -588,7 +588,9 @@ binary_sensor:
                           announcement: true
                       - media_player.play_media:
                           id: external_media_player
-                          media_url: "${research_base}/static/research_prompt.mp3"
+                          # Bridge-generated edge-tts clip (same voice as every other
+                          # mode) instead of the old mechanical .115 research_prompt.mp3.
+                          media_url: "${quickchat_base}/quick-chat-static/quick_chat_research_prompt.mp3"
                           announcement: true
                       - delay: 500ms
                       - wait_until:
