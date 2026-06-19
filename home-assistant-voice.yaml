@@ -2297,8 +2297,11 @@ voice_assistant:
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
   on_client_disconnected:
-    - lambda: |-
-        ESP_LOGW("research_webhook", "voice assistant API client disconnected");
+    # NOTE: do NOT log here. This trigger fires from inside ~APIConnection() (the
+    # client is being destroyed); an ESP_LOG routes to the API log-listener, which
+    # dereferences the connection currently being freed -> LoadProhibited crash ->
+    # reboot. Was crashing the device on every bridge restart / API drop. Just
+    # stop the assistant and refresh the LEDs.
     - voice_assistant.stop:
     - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
     - script.execute: control_leds
