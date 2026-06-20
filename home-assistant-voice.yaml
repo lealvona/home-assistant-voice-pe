@@ -495,13 +495,23 @@ binary_sensor:
                                                   id: external_media_player
                                                   media_url: "${quickchat_base}/quick-chat-static/quick_chat_prompt.mp3"
                                                   announcement: true
-                                              - delay: 300ms
+                                              # Wait for the prompt to actually START, then FINISH, before opening
+                                              # the mic. A fixed delay alone raced the media fetch/buffer latency:
+                                              # if the clip had not begun by the delay, `not is_announcing` was
+                                              # already true and the mic opened over the prompt (the device then
+                                              # transcribed its own prompt). Anchor on the real announcement
+                                              # lifecycle instead.
+                                              - wait_until:
+                                                  condition:
+                                                    media_player.is_announcing:
+                                                      id: external_media_player
+                                                  timeout: 3s
                                               - wait_until:
                                                   condition:
                                                     not:
                                                       media_player.is_announcing:
                                                         id: external_media_player
-                                                  timeout: 5s
+                                                  timeout: 8s
                                               - delay: 150ms
                                               - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
                                               - script.execute: control_leds
@@ -601,7 +611,13 @@ binary_sensor:
                           # mode) instead of the old mechanical .115 research_prompt.mp3.
                           media_url: "${quickchat_base}/quick-chat-static/quick_chat_research_prompt.mp3"
                           announcement: true
-                      - delay: 500ms
+                      # Wait for the prompt to actually START, then FINISH, before
+                      # opening the mic (see single-press note).
+                      - wait_until:
+                          condition:
+                            media_player.is_announcing:
+                              id: external_media_player
+                          timeout: 3s
                       - wait_until:
                           condition:
                             not:
@@ -1313,13 +1329,20 @@ script:
                 id: external_media_player
                 media_url: !lambda return prompt_url;
                 announcement: true
-            - delay: 300ms
+            # Wait for the prompt to actually START, then FINISH, before opening the
+            # mic (see single-press note): a fixed delay alone raced the media
+            # fetch/buffer latency and let the mic open over the prompt.
+            - wait_until:
+                condition:
+                  media_player.is_announcing:
+                    id: external_media_player
+                timeout: 3s
             - wait_until:
                 condition:
                   not:
                     media_player.is_announcing:
                       id: external_media_player
-                timeout: 5s
+                timeout: 8s
             - delay: 150ms
             - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
             - script.execute: control_leds
@@ -2143,13 +2166,19 @@ micro_wake_word:
                                       id: external_media_player
                                       media_url: "${quickchat_base}/quick-chat-static/quick_chat_wake.mp3"
                                       announcement: true
-                                  - delay: 350ms
+                                  # Wait for the greeting to actually START, then FINISH,
+                                  # before opening the mic (see single-press note).
+                                  - wait_until:
+                                      condition:
+                                        media_player.is_announcing:
+                                          id: external_media_player
+                                      timeout: 3s
                                   - wait_until:
                                       condition:
                                         not:
                                           media_player.is_announcing:
                                             id: external_media_player
-                                      timeout: 1500ms
+                                      timeout: 2500ms
                             # Wake-word quick chat uses the direct-LLM path (same
                             # as a single press); on_stt_end reads capture_mode.
                             - lambda: id(capture_mode) = ${capture_mode_direct};
