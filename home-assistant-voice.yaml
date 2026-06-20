@@ -174,7 +174,10 @@ api:
     - script.execute: control_leds
   on_client_disconnected:
     - script.execute: control_leds
-  encryption:   # Uses key set by Home Assistant
+  # NO `encryption:` block — these units are owned by the Voice PE research bridge
+  # over the unencrypted native API, NOT Home Assistant. An `encryption:` block lets
+  # HA set a noise key on adoption, which then LOCKS THE BRIDGE OUT (RequiresEncryption).
+  # That happened 2026-06-19 after an HA update re-adopted both devices. Keep removed.
 
 ota:
   - platform: esphome
