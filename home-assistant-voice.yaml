@@ -174,10 +174,18 @@ api:
     - script.execute: control_leds
   on_client_disconnected:
     - script.execute: control_leds
-  # NO `encryption:` block — these units are owned by the Voice PE research bridge
-  # over the unencrypted native API, NOT Home Assistant. An `encryption:` block lets
-  # HA set a noise key on adoption, which then LOCKS THE BRIDGE OUT (RequiresEncryption).
-  # That happened 2026-06-19 after an HA update re-adopted both devices. Keep removed.
+  # API encryption with a key the BRIDGE holds and Home Assistant does NOT. This is
+  # what keeps the bridge the SOLE owner of the device: without the key no client
+  # can connect at all, so HA can neither adopt the device nor drive its voice
+  # pipeline — which was the source of the 2026-06-20 API contention + self-trigger
+  # loop (two clients fighting over the voice-assistant session). The bridge connects
+  # with this same key via VOICE_PE_API_PSK.
+  # NOTE: this is the INVERSE of the 2026-06-19 lockout — back then HA SET its own
+  # key on adoption and locked the bridge out; here WE set the key (firmware secret),
+  # so HA is the one locked out, not the bridge. Do NOT remove without a plan to keep
+  # HA off these devices another way.
+  encryption:
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome
