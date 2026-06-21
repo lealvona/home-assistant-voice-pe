@@ -2229,7 +2229,14 @@ micro_wake_word:
                                       timeout: 2500ms
                             # Wake-word quick chat uses the direct-LLM path (same
                             # as a single press); on_stt_end reads capture_mode.
-                            - lambda: id(capture_mode) = ${capture_mode_direct};
+                            - lambda: |-
+                                id(capture_mode) = ${capture_mode_direct};
+                                // A wake word is a deliberate new "open" (like a button
+                                // press), so clear any lingering cancel-suppression. Without
+                                // this, a prior button-cancel leaves cancel_press_consumed
+                                // set (only on_press clears it) and the on_start guard aborts
+                                // EVERY wake run at birth (device-stop-aborted, 0 bytes).
+                                id(cancel_press_consumed) = false;
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
                                 silence_detection: true
