@@ -216,6 +216,11 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Counts seconds of genuine inactivity for the long idle hard-reset watchdog.
+  - id: idle_reset_ticks
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Global initialization variable. Initialized to true and set to false once everything is connected. Only used to have a smooth "plugging" experience
   - id: init_in_progress
     type: bool
@@ -2360,6 +2365,35 @@ interval:
             id(quick_chat_announcement_count) = 0;
             id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
             id(led_idle_ticks) = 0;
+            id(control_leds).execute();
+          }
+
+  # Long inactivity hard-reset (~10 min): belt-and-suspenders backstop to the
+  # fast LED watchdog above. If NOTHING genuine has happened for ~10 minutes (no
+  # VA run, no audio playback, no button/dial, no ringing timer), force the WHOLE
+  # flow state back to a clean ready state -- including flags the fast watchdog
+  # doesn't clear (capture_mode, awaiting_clarification, cancel_press_consumed).
+  # 10 min of genuine silence == the device is idle, so this can never fire mid-
+  # interaction.
+  - interval: 5s
+    then:
+      - lambda: |-
+          bool media_busy = id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING
+                         || id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          bool genuine = id(va).is_running() || media_busy || id(center_button).state
+                      || id(dial_touched) || id(timer_ringing).state;
+          if (genuine) { id(idle_reset_ticks) = 0; return; }
+          id(idle_reset_ticks) += 5;  // this interval runs every 5s
+          if (id(idle_reset_ticks) >= 600) {  // ~10 minutes of genuine silence
+            ESP_LOGW("idle_reset", "10 min no activity -> full reset to ready state");
+            id(quick_chat_pending) = false;
+            id(quick_chat_expecting_announcement) = false;
+            id(quick_chat_announcement_count) = 0;
+            id(awaiting_clarification) = false;
+            id(capture_mode) = ${capture_mode_none};
+            id(cancel_press_consumed) = false;
+            id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+            id(idle_reset_ticks) = 0;
             id(control_leds).execute();
           }
 
