@@ -290,6 +290,13 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Set by the center-button on_press when that press cancelled an active flow,
+  # so the subsequent on_multi_click single-click does NOT then start a new turn.
+  # Cleared at the top of every on_press, so it only ever reflects the current press.
+  - id: cancel_press_consumed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # Generation counter for quick-chat requests. Incremented on each button press.
   # The on_state handler only counts announcements matching the current generation,
   # so overlapping requests (pressing again before the first answer arrives) don't
@@ -426,6 +433,37 @@ binary_sensor:
       number: GPIO0
       inverted: true
     on_press:
+      # UNIVERSAL CANCEL: any press during an active flow (listening / thinking /
+      # responding / awaiting input) aborts everything AND tells the bridge to stop.
+      # An idle press sets nothing here and falls through to on_multi_click to start.
+      - lambda: |-
+          id(cancel_press_consumed) = false;
+          bool flow_active = id(quick_chat_pending) || id(awaiting_clarification)
+                             || id(va).is_running()
+                             || id(quick_chat_expecting_announcement);
+          if (flow_active) {
+            id(cancel_press_consumed) = true;
+            id(quick_chat_generation) += 1;  // invalidate any in-flight result
+            std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                               "\",\"text\":\"stop\",\"barge\":true}";
+            voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                 id(quick_chat_generation));
+            id(quick_chat_pending) = false;
+            id(quick_chat_expecting_announcement) = false;
+            id(quick_chat_announcement_count) = 0;
+            id(awaiting_clarification) = false;
+            id(capture_mode) = ${capture_mode_none};
+            id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+            ESP_LOGI("cancel", "button cancel: aborting active flow + notifying bridge");
+          }
+      - if:
+          condition:
+            lambda: return id(cancel_press_consumed);
+          then:
+            - voice_assistant.stop:
+            - media_player.stop:
+                id: external_media_player
+                announcement: true
       - script.execute: control_leds
     on_release:
       - script.execute: control_leds
@@ -486,6 +524,8 @@ binary_sensor:
                                                 - switch.is_off: master_mute_switch
                                                 - not: voice_assistant.is_running
                                                 - lambda: return id(va).get_api_connection() != nullptr;
+                                                # Don't start a new turn if THIS press just cancelled an active flow.
+                                                - lambda: return !id(cancel_press_consumed);
                                             then:
                                               - lambda: |-
                                                   ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
