@@ -2414,10 +2414,23 @@ voice_assistant:
               sound_file: "error_cloud_expired"
   # When the voice assistant starts: Play a wake up sound, duck audio.
   on_start:
-    - mixer_speaker.apply_ducking:
-        id: media_mixing_input
-        decibel_reduction: 20  # Number of dB quieter; higher implies more quiet, 0 implies full volume
-        duration: 0.0s         # The duration of the transition (default is no transition)
+    # Make a button cancel TERMINAL. If a press just cancelled an active flow,
+    # `cancel_press_consumed` is still set (it's only cleared at the top of the
+    # NEXT on_press). Any run that auto-re-opens (the continue/re-listen cycle)
+    # therefore gets aborted at birth, so one press lands the device idle and
+    # KEEPS it idle. A deliberate new press clears the flag in on_press first, so
+    # an intentional new turn is never blocked.
+    - if:
+        condition:
+          lambda: return id(cancel_press_consumed);
+        then:
+          - lambda: ESP_LOGI("cancel", "auto-continue suppressed after cancel — staying idle");
+          - voice_assistant.stop:
+        else:
+          - mixer_speaker.apply_ducking:
+              id: media_mixing_input
+              decibel_reduction: 20  # Number of dB quieter; higher implies more quiet, 0 implies full volume
+              duration: 0.0s         # The duration of the transition (default is no transition)
   on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
     - script.execute: control_leds
