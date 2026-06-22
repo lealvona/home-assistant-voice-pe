@@ -458,7 +458,10 @@ binary_sensor:
             id(quick_chat_announcement_count) = 0;
             id(awaiting_clarification) = false;
             id(capture_mode) = ${capture_mode_none};
-            id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+            // Cancellation indicator = RED (error phase). Was waiting_for_command
+            // (amber), which collides with "wake fired, waiting for you to speak";
+            // a cancel must read as a hard stop, not as "go ahead and talk".
+            id(voice_assistant_phase) = ${voice_assist_error_phase_id};
             ESP_LOGI("cancel", "button cancel: aborting active flow + notifying bridge");
           }
       - if:
