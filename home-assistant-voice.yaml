@@ -2133,7 +2133,10 @@ micro_wake_word:
   microphone:
     microphone: i2s_mics
     channels: 1
-    gain_factor: 4
+    # Wake-mic gain. 4x was far too hot -> the wake models false-triggered on
+    # ambient/TV/movie dialogue, self-activating the device. Halved to cut the
+    # false-positive rate while keeping a deliberate nearby wake audible. Tunable.
+    gain_factor: 2
   stop_after_detection: false
   models:
     - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWordsV3/hey_computer.json
