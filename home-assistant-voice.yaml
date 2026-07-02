@@ -584,8 +584,10 @@ binary_sensor:
                                                         id: external_media_player
                                                   timeout: 8s
                                               - delay: 150ms
-                                              - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                                              - script.execute: control_leds
+                                              # Ready indicator (amber) is set by voice_assistant.on_listening —
+                                              # i.e. when the mic is ACTUALLY streaming — not here. Painting it
+                                              # before va.start invited users to speak into a dead mic (clipped
+                                              # leading words like "turn on").
                                               - voice_assistant.start:
                                                   silence_detection: true
       # Double Click -> quick ask to the Hermes AGENT (tools / web search / skills).
@@ -701,8 +703,7 @@ binary_sensor:
                       - delay: 300ms
                       - lambda: |-
                           ESP_LOGI("research_webhook", "prompt complete/timeout; starting research STT");
-                          id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                      - script.execute: control_leds
+                      # Amber comes from on_listening (mic actually live), not pre-start.
                       - voice_assistant.start:
                           silence_detection: true
                     else:
@@ -1430,8 +1431,8 @@ script:
                       id: external_media_player
                 timeout: 8s
             - delay: 150ms
-            - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-            - script.execute: control_leds
+            # Ready indicator (amber) is set by voice_assistant.on_listening —
+            # when the mic is ACTUALLY streaming — never before va.start.
             - voice_assistant.start:
                 silence_detection: true
           else:
