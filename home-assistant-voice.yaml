@@ -221,6 +221,13 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Seconds the media player has been continuously ANNOUNCING with no VA run —
+  # for the stale-announcement watchdog (a wedged announcement pipeline blocks
+  # every other watchdog via media_busy).
+  - id: announcing_ticks
+    type: int
+    restore_value: no
+    initial_value: '0'
   # True when the CURRENT capture was deliberately initiated (button press or
   # wake word) as opposed to a bridge-driven continue re-arm. Sent to the bridge
   # as "pressed" in the quick-chat POST (a pressed turn is never a continuation),
@@ -2392,6 +2399,31 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
+          // Stale-announcement watchdog: the announcement pipeline can wedge in
+          // ANNOUNCING after a clip ends. Everything else (phase clear, pending
+          // cap, the idle watchdog below) blocks on media_busy, so the ring
+          // spins blue forever with nothing playing. No legitimate announcement
+          // runs 2 minutes; force-stop and idle.
+          if (id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING
+              && !id(va).is_running()) {
+            id(announcing_ticks) += 1;
+            if (id(announcing_ticks) >= 120) {
+              ESP_LOGW("led_watchdog", "announcement wedged for %ds; force-stopping media", id(announcing_ticks));
+              auto call = id(external_media_player).make_call();
+              call.set_command(media_player::MEDIA_PLAYER_COMMAND_STOP);
+              call.set_announcement(true);
+              call.perform();
+              id(quick_chat_pending) = false;
+              id(quick_chat_expecting_announcement) = false;
+              id(quick_chat_announcement_count) = 0;
+              id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+              id(announcing_ticks) = 0;
+              id(control_leds).execute();
+              return;
+            }
+          } else {
+            id(announcing_ticks) = 0;
+          }
           int p = id(voice_assistant_phase);
           bool transient = (p == ${voice_assist_waiting_for_command_phase_id} ||
                             p == ${voice_assist_listening_for_command_phase_id} ||
