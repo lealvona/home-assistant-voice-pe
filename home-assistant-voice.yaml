@@ -221,6 +221,14 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # True when the CURRENT capture was deliberately initiated (button press or
+  # wake word) as opposed to a bridge-driven continue re-arm. Sent to the bridge
+  # as "pressed" in the quick-chat POST (a pressed turn is never a continuation),
+  # then cleared.
+  - id: capture_user_initiated
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # Global initialization variable. Initialized to true and set to false once everything is connected. Only used to have a smooth "plugging" experience
   - id: init_in_progress
     type: bool
@@ -445,7 +453,13 @@ binary_sensor:
           id(cancel_press_consumed) = false;
           bool flow_active = id(quick_chat_pending) || id(awaiting_clarification)
                              || id(va).is_running()
-                             || id(quick_chat_expecting_announcement);
+                             || id(quick_chat_expecting_announcement)
+                             // An armed capture (prompt/greeting still playing,
+                             // mic not yet open) is an active flow too — without
+                             // this, a press during the prompt stopped the audio
+                             // but the deferred voice_assistant.start still fired
+                             // and the mic opened green after a "cancel".
+                             || id(capture_mode) != ${capture_mode_none};
           if (flow_active) {
             id(cancel_press_consumed) = true;
             id(quick_chat_generation) += 1;  // invalidate any in-flight result
@@ -538,6 +552,7 @@ binary_sensor:
                                               - lambda: |-
                                                   ESP_LOGI("quick_chat", "single-press quick chat prompt; starting STT after prompt");
                                                   id(capture_mode) = ${capture_mode_direct};
+                                                  id(capture_user_initiated) = true;
                                                   id(quick_chat_pending) = false;
                                                   id(quick_chat_expecting_announcement) = false;
                                                   id(quick_chat_announcement_count) = 0;
@@ -587,6 +602,7 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
+                - lambda: id(capture_user_initiated) = true;
                 - script.execute:
                     id: quick_capture
                     mode: ${capture_mode_agent}
@@ -606,6 +622,7 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed) && !id(group_volume_changed);
               then:
+                - lambda: id(capture_user_initiated) = true;
                 - script.execute:
                     id: quick_capture
                     mode: ${capture_mode_agent_photo}
@@ -656,6 +673,7 @@ binary_sensor:
                       - lambda: |-
                           ESP_LOGI("research_webhook", "long-press research mode armed; playing prompt");
                           id(capture_mode) = ${capture_mode_research};
+                          id(capture_user_initiated) = true;
                           id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
                       - script.execute: control_leds
                       - media_player.stop:
@@ -1381,6 +1399,18 @@ script:
             - media_player.stop:
                 id: external_media_player
                 announcement: true
+            # Let any previous announcement (e.g. the research vad-end chime)
+            # FULLY stop before issuing PLAY — a play issued into a stopping
+            # announcement pipeline is silently dropped, and the is_announcing
+            # waits below then anchor to the OLD announcement's teardown and
+            # open the mic ~0.4s later with no prompt ever heard. (This was why
+            # the "Local, or cloud?" clarify question never played.)
+            - wait_until:
+                condition:
+                  not:
+                    media_player.is_announcing:
+                      id: external_media_player
+                timeout: 2s
             - media_player.play_media:
                 id: external_media_player
                 media_url: !lambda return prompt_url;
@@ -1890,16 +1920,22 @@ script:
             media_player.is_announcing:
               id: external_media_player
           timeout: 5s
-      - delay: 1s
+      - delay: 300ms
       # Enable the transient "Stop" barge-in word for the rest of the answer
-      # playback, then disable it again so it isn't an always-on word. The 1s
-      # delay above skips the answer's opening word — the announcement channel
+      # playback, then disable it again so it isn't an always-on word. The short
+      # delay above skips the answer's opening syllable — the announcement channel
       # is NOT ducked and the XU316 AEC doesn't cancel the device's own TTS, so
       # the model hears the answer at full volume; the delay + a distinctive
-      # word keep self-triggering low.
+      # word keep self-triggering low. (Was 1s, which consumed short clips
+      # entirely and left no window to say "stop".)
       - if:
           condition:
-            switch.is_off: timer_ringing
+            and:
+              - switch.is_off: timer_ringing
+              # Abort if the announcement already ended during the delay (short
+              # clip) — arming now would strand the stop word until the 60s cap.
+              - media_player.is_announcing:
+                  id: external_media_player
           then:
             - micro_wake_word.enable_model: stop
             # Bounded wait so disable_model ALWAYS runs even if the announcing
@@ -2073,6 +2109,17 @@ media_player:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
+      # Arm the transient "stop" barge word for the duration of any quick-chat
+      # announcement (receipt / cue / answer). This was previously triggered only
+      # from on_tts_start / on_intent_progress — pipeline events the bridge never
+      # sends — so saying "stop" during a bridge-driven answer did NOTHING.
+      - if:
+          condition:
+            lambda: |-
+              return id(quick_chat_pending) || id(quick_chat_expecting_announcement)
+                     || id(awaiting_clarification);
+          then:
+            - script.execute: activate_stop_word_once
     on_state:
       - if:
           condition:
@@ -2136,20 +2183,21 @@ micro_wake_word:
   microphone:
     microphone: i2s_mics
     channels: 1
-    # Wake-mic gain. 4x was far too hot -> the wake models false-triggered on
-    # ambient/TV/movie dialogue, self-activating the device. Halved to cut the
-    # false-positive rate while keeping a deliberate nearby wake audible. Tunable.
-    gain_factor: 2
+    # Stock gain for the canonical kahrendt models below — their published
+    # cutoffs (and the sensitivity select) are calibrated at this gain. The old
+    # community models (janet et al) false-triggered wildly at 4x; these bench
+    # at <0.2 false-accepts/hour, so the calibrated config is the right one.
+    gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWordsV3/hey_computer.json
-      id: hey_computer
-    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWordsV3/ok_computer.json
-      id: ok_computer
-    - model: https://raw.githubusercontent.com/andrew-transparent/carson-wake-words/main/mister_carson.json
-      id: mister_carson
-    - model: https://raw.githubusercontent.com/TaterTotterson/microWakeWords/main/microWakeWords/janet.json
-      id: janet
+    # Canonical, DipCo-benchmarked models (kahrendt / OHF-Voice). The old
+    # community set (hey_computer / ok_computer / mister_carson / janet) is
+    # gone: janet (old V1 collection) triggered on everything BUT "janet",
+    # and mister_carson never worked.
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    - model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/hey_jarvis.json
+      id: hey_jarvis
     # Transient "Stop" barge-in word. Disabled by default (only model index 0 is
     # enabled on boot; state persists to flash) and kept out of the user-facing
     # wake-word UI via internal:true. activate_stop_word_once enables it ONLY
@@ -2188,23 +2236,20 @@ micro_wake_word:
                                 announcement: true
                                 id: external_media_player
                             # Barge-in: the user said "stop" (or a wake word)
-                            # while an answer was playing. Stopping the audio is
-                            # local (above); also tell the :6060 bridge to TERMINATE
-                            # so it bumps its generation and suppresses the pending
-                            # continue re-arm. BUT only when a quick-chat is actually
-                            # in flight (receipt/thinking/answer) — guarded by
-                            # quick_chat_pending — so interrupting a non-chat
-                            # announcement (research prompt, wake greeting) doesn't
-                            # fire a spurious barge-cancel. Dead stop.
-                            - if:
-                                condition:
-                                  lambda: return id(quick_chat_pending);
-                                then:
-                                  - lambda: |-
-                                      std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
-                                                         "\",\"text\":\"stop\",\"barge\":true}";
-                                      voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
-                                                                           id(quick_chat_generation));
+                            # while an announcement was playing. Stopping the audio
+                            # is local (above); ALWAYS also tell the bridge to
+                            # TERMINATE so it bumps its generation and suppresses
+                            # any pending continue re-arm. This used to be gated on
+                            # quick_chat_pending, but extra cue clips falsify the
+                            # announcement counter and clear pending EARLY — the
+                            # barge then went unsent and the bridge re-armed the mic
+                            # into a dead session. The bridge's barge handler is
+                            # idempotent and harmless when idle, so no gate.
+                            - lambda: |-
+                                std::string body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
+                                                   "\",\"text\":\"stop\",\"barge\":true}";
+                                voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
+                                                                     id(quick_chat_generation));
                           # Start the voice assistant. When wake_sound is on,
                           # play a context-relevant verbal greeting served by
                           # the bridge ("Yes?") instead of the generic chime —
@@ -2248,6 +2293,14 @@ micro_wake_word:
                                 // set (only on_press clears it) and the on_start guard aborts
                                 // EVERY wake run at birth (device-stop-aborted, 0 bytes).
                                 id(cancel_press_consumed) = false;
+                                // Also drop any STALE clarify wait (stranded by a spoken
+                                // cancel, which only sends RUN_END) — otherwise this fresh
+                                // question gets tagged clarify_followup and re-dispatches a
+                                // minutes-old original ask.
+                                id(awaiting_clarification) = false;
+                                // Deliberate initiation: this capture is a fresh open, never
+                                // a continuation of the previous loop (see "pressed" POST flag).
+                                id(capture_user_initiated) = true;
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
                                 silence_detection: true
@@ -2265,15 +2318,21 @@ select:
       - Moderately sensitive
       - Very sensitive
     on_value:
-      # Dynamic/community wake-word models do not share the calibrated cutoff
-      # values that the stock firmware used for okay_nabu / hey_jarvis /
-      # hey_mycroft. Keep the UI entity for compatibility, but do not reference
-      # hard-coded model IDs that may not be present in a per-device build.
-      - logger.log:
-          tag: voice_assistant
-          level: INFO
-          format: "Wake word sensitivity preset selected: %s; custom models keep their model defaults"
-          args: ["x.c_str()"]
+      # Calibrated quantized cutoffs from the stock firmware (DipCo false-accept
+      # benchmarks), valid for okay_nabu@20241226.3 and hey_jarvis@v2 — the
+      # models this build ships. Higher = stricter (fewer false accepts).
+      - lambda: |-
+          if (x == "Slightly sensitive") {
+            id(okay_nabu).set_probability_cutoff(217);   // 0.85 (manifest default)
+            id(hey_jarvis).set_probability_cutoff(247);  // 0.97 (manifest default)
+          } else if (x == "Moderately sensitive") {
+            id(okay_nabu).set_probability_cutoff(176);   // 0.69
+            id(hey_jarvis).set_probability_cutoff(235);  // 0.92
+          } else if (x == "Very sensitive") {
+            id(okay_nabu).set_probability_cutoff(143);   // 0.56
+            id(hey_jarvis).set_probability_cutoff(212);  // 0.83
+          }
+          ESP_LOGI("voice_assistant", "Wake word sensitivity: %s", x.c_str());
 
 # Surface a failed quick-chat POST on the main loop. The POST runs on a worker
 # task (voice_dispatch.h); on failure it tags an atomic with its generation,
@@ -2308,6 +2367,10 @@ interval:
               if (voice_dispatch::peek_quickchat_clarify_gen() != id(quick_chat_generation)) return false;
               if (id(master_mute_switch).state || id(va).is_running() ||
                   id(va).get_api_connection() == nullptr) return false;
+              // Let a draining announcement (research vad-end chime) finish first:
+              // claiming while it's ANNOUNCING would issue the clarify PLAY into a
+              // stopping pipeline and lose the prompt. Peek retries every 250ms.
+              if (id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING) return false;
               voice_dispatch::take_quickchat_clarify_gen();  // consume; we will arm now
               return true;
           then:
@@ -2342,7 +2405,11 @@ interval:
           // reply (no answer), a failed search, or extra progress cues can leave
           // quick_chat_pending stuck true and the ring spinning forever. If it's
           // been pending too long and nothing is actually playing, force idle.
-          bool pending_fresh = id(quick_chat_pending) && (millis() - id(quick_chat_pending_since) < 22000);
+          // Cap must exceed the agent path's 75s AGENT_TIMEOUT — at 22s it fired
+          // mid-agent-turn, cleared the flow flags, and turned "press to cancel a
+          // slow agent" into "accidentally start a new turn". True stuck spinners
+          // are still cleared by the 90s quick_chat_timeout.
+          bool pending_fresh = id(quick_chat_pending) && (millis() - id(quick_chat_pending_since) < 85000);
           if (id(quick_chat_pending) && !pending_fresh && !media_busy) {
             ESP_LOGW("led_watchdog", "quick-chat thinking exceeded cap; clearing stuck spinner");
             id(quick_chat_pending) = false;
@@ -2390,7 +2457,7 @@ interval:
                       || id(dial_touched) || id(timer_ringing).state;
           if (genuine) { id(idle_reset_ticks) = 0; return; }
           id(idle_reset_ticks) += 5;  // this interval runs every 5s
-          if (id(idle_reset_ticks) >= 600) {  // ~10 minutes of genuine silence
+          if (id(idle_reset_ticks) >= 480) {  // ~8 min, aligned with the bridge's idle reset
             ESP_LOGW("idle_reset", "10 min no activity -> full reset to ready state");
             id(quick_chat_pending) = false;
             id(quick_chat_expecting_announcement) = false;
@@ -2413,7 +2480,7 @@ voice_assistant:
   media_player: external_media_player
   micro_wake_word: mww
   use_wake_word: false
-  noise_suppression_level: 0
+  noise_suppression_level: 1  # light cleanup stabilizes STT + endpointing in noisy rooms
   auto_gain: 0 dbfs
   volume_multiplier: 1
   on_client_connected:
@@ -2589,13 +2656,18 @@ voice_assistant:
                   // Save in case the bridge asks us to clarify this question.
                   id(clarify_orig_mode) = cm;
                   id(clarify_orig_text) = transcript;
+                  // "pressed": deliberate initiation (button/wake) vs a bridge
+                  // continue re-arm — a pressed turn is never a continuation.
+                  bool was_pressed = id(capture_user_initiated);
                   body = "{\"source\":\"" + std::string(App.get_name().c_str()) +
                          "\",\"text\":\"" + transcript_esc +
                          "\",\"mode\":\"" + std::string(mode) + "\",\"clarify_capable\":true" +
+                         (was_pressed ? ",\"pressed\":true" : "") +
                          (want_photo ? ",\"photo\":true" : "") + "}";
                 }
               }
               id(capture_mode) = ${capture_mode_none};
+              id(capture_user_initiated) = false;  // one-shot: consumed by this POST
               voice_dispatch::quickchat_post_async("${quickchat_base}/quick-chat", body, 1500,
                                                    id(quick_chat_generation));
   on_intent_progress:
