@@ -141,3 +141,8 @@ sdkconfig.*
 
 # Local-only secrets (WiFi creds, etc) — do NOT commit
 secrets.yaml
+
+# Never commit backup copies — they can carry WiFi creds / LAN config
+*.bak
+*.bak.*
+secrets.yaml.bak.*
