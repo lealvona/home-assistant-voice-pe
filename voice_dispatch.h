@@ -42,6 +42,31 @@ inline std::atomic<int> &inflight() {
   return n;
 }
 
+// Whether inflight() is currently at the cap, and the millis() at which it got
+// there. Kept as an explicit flag rather than a 0-means-idle sentinel: millis()
+// is legitimately 0 for the first tick after boot, and a sentinel collision
+// would leave the stuck-reset guard permanently disarmed.
+inline std::atomic<bool> &inflight_saturated() {
+  static std::atomic<bool> f{false};
+  return f;
+}
+inline std::atomic<uint32_t> &inflight_saturated_at() {
+  static std::atomic<uint32_t> t{0};
+  return t;
+}
+
+// A legitimate dispatch completes in well under 2 s (the callers pass timeouts
+// of 800-1500 ms). If the cap stays saturated far longer than that, the tasks
+// holding the slots are not busy — they are wedged inside a blocking socket
+// call against a bridge that went away mid-POST, and they will never return to
+// decrement. Before this guard the leak was PERMANENT: inflight() stuck at
+// MAX_INFLIGHT meant spawn_worker dropped every future dispatch BEFORE the HTTP
+// call, so the device kept doing wake/STT normally but silently never posted a
+// transcript again until someone power-cycled it. Observed 2026-08-23 on both
+// units after a bridge restart; symptom is a voice turn that reaches "STT
+// transcript" on the bridge and then simply stops.
+constexpr uint32_t INFLIGHT_STUCK_RESET_MS = 60000;
+
 // Quick-chat POST result, packed as (generation << 2) | code, observed on the
 // main loop. code: 0 = pending, 1 = ok, 2 = failed, 3 = clarify (the bridge
 // needs a spoken local/cloud answer before it can dispatch). The generation tag
@@ -192,14 +217,36 @@ inline int do_post_capture(const std::string &url, const std::string &body, uint
 // dropped or the task can't be created. NOTE: post_*/quickchat_post_async are
 // only ever called from the single ESPHome main loop, so the cap's
 // load()-then-increment is not a real race; workers only ever decrement.
+// Give back a slot. Clamps at zero because a worker that was declared leaked
+// (and had its slot reclaimed) may still eventually return and decrement.
+inline void release_inflight() {
+  if (inflight().fetch_sub(1) - 1 <= 0) inflight().store(0);
+  if (inflight().load() < MAX_INFLIGHT) inflight_saturated().store(false);
+}
+
 template<typename Job>
 inline bool spawn_worker(const char *name, TaskFunction_t fn, Job *job, const char *tag) {
   if (inflight().load() >= MAX_INFLIGHT) {
-    ESP_LOGW(tag, "dropping dispatch: %d worker tasks already in flight", MAX_INFLIGHT);
-    delete job;
-    return false;
+    // Unsigned subtraction is deliberate: it stays correct across the ~49.7-day
+    // millis() rollover.
+    const bool sat = inflight_saturated().load();
+    const uint32_t held = sat ? (millis() - inflight_saturated_at().load()) : 0;
+    if (sat && held > INFLIGHT_STUCK_RESET_MS) {
+      // Leaked slots — recover rather than stay broken until a power cycle.
+      ESP_LOGE(tag, "inflight cap saturated for %ums: assuming %d leaked worker(s), resetting",
+               (unsigned) held, MAX_INFLIGHT);
+      inflight().store(0);
+      inflight_saturated().store(false);
+    } else {
+      ESP_LOGW(tag, "dropping dispatch: %d worker tasks already in flight", MAX_INFLIGHT);
+      delete job;
+      return false;
+    }
   }
-  inflight().fetch_add(1);
+  if (inflight().fetch_add(1) + 1 >= MAX_INFLIGHT && !inflight_saturated().load()) {
+    inflight_saturated_at().store(millis());
+    inflight_saturated().store(true);
+  }
   if (xTaskCreate(fn, name, TASK_STACK, job, TASK_PRIO, nullptr) != pdPASS) {
     ESP_LOGE(tag, "failed to spawn worker task");
     inflight().fetch_sub(1);
@@ -222,7 +269,7 @@ inline void post_task(void *arg) {
   PostJob *job = static_cast<PostJob *>(arg);
   do_post(job->url, job->body, job->timeout_ms, job->tag);
   delete job;
-  inflight().fetch_sub(1);
+  release_inflight();
   vTaskDelete(nullptr);
 }
 
@@ -289,7 +336,7 @@ inline void qc_task(void *arg) {
   int desired = (job->generation << 2) | code;
   qc_state().compare_exchange_strong(expected, desired);
   delete job;
-  inflight().fetch_sub(1);
+  release_inflight();
   vTaskDelete(nullptr);
 }
 
